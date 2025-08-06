@@ -103,7 +103,10 @@ cleanup() {
 
     # Compress rosbag
     echo "Compress rosbag"
-    if [ -d "rosbag2_autoware" ]; then
+    if [ "$1" == "record" ] && [ -d "nn_planner_rosbag" ]; then
+        tar -czf nn_planner_rosbag_$(date +%Y%m%d-%H%M%S).tar.gz nn_planner_rosbag
+        rm -rf nn_planner_rosbag
+    elif [ -d "rosbag2_autoware" ]; then
         tar -czf rosbag2_autoware.tar.gz rosbag2_autoware
         rm -rf rosbag2_autoware
     fi
@@ -126,7 +129,7 @@ cleanup() {
     exit 0
 }
 # Trap Ctrl+C (SIGINT) and normal termination (EXIT)
-trap cleanup SIGINT SIGTERM EXIT
+trap 'cleanup "$1"' SIGINT SIGTERM EXIT
 
 # Move working directory
 OUTPUT_DIRECTORY=$(date +%Y%m%d-%H%M%S)
@@ -160,15 +163,27 @@ echo "$PID_AUTOWARE" >>"$PID_FILE"
 get_child_pids "$PID_AUTOWARE"
 sleep 3
 
-# Start recording rosbag with nohup
-echo "Start rosbag"
-nohup ros2 bag record -a -o rosbag2_autoware >/dev/null 2>&1 &
-PID_ROSBAG=$!
-echo "ROS Bag PID: $PID_ROSBAG"
-echo "$PID_ROSBAG" >>"$PID_FILE"
-# recursively get child processes
-get_child_pids "$PID_ROSBAG"
-sleep 5
+# Start recording rosbag with nohup if 'record' argument is provided
+if [ "$1" == "record" ]; then
+    echo "Start rosbag for NN Planner training"
+    TOPICS_TO_RECORD="/localization/kinematic_state /map/vector_map /tf /tf_static /planning/scenario_planning/trajectory /vehicle/status/velocity_status /vehicle/status/steering_status /control/command/control_cmd"
+    nohup ros2 bag record -o nn_planner_rosbag $TOPICS_TO_RECORD >/dev/null 2>&1 &
+    PID_ROSBAG=$!
+    echo "ROS Bag PID for NN Planner: $PID_ROSBAG"
+    echo "$PID_ROSBAG" >>"$PID_FILE"
+    get_child_pids "$PID_ROSBAG"
+    sleep 5
+else
+    # Start recording rosbag with nohup
+    echo "Start rosbag"
+    nohup ros2 bag record -a -o rosbag2_autoware >/dev/null 2>&1 &
+    PID_ROSBAG=$!
+    echo "ROS Bag PID: $PID_ROSBAG"
+    echo "$PID_ROSBAG" >>"$PID_FILE"
+    # recursively get child processes
+    get_child_pids "$PID_ROSBAG"
+    sleep 5
+fi
 
 # run updater
 (

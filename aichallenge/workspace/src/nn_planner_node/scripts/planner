@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+
+import numpy as np
+import torch
+import torch.nn as nn
+from pathlib import Path
+import sys
+import os
+
+from nav_msgs.msg import Odometry
+from autoware_auto_planning_msgs.msg import Trajectory
+from geometry_msgs.msg import PoseStamped, AccelWithCovarianceStamped
+
+
+class SimplerVelocityLSTM(nn.Module):
+    """
+    Simpler LSTM model for velocity prediction.
+    """
+    
+    def __init__(self, input_size=13, hidden_size=256, num_layers=2, output_seq_len=50, dropout=0.2):
+        super(SimplerVelocityLSTM, self).__init__()
+        
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.output_seq_len = output_seq_len
+        
+        # LSTM layers
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0,
+            batch_first=True
+        )
+        
+        # Direct mapping to output sequence
+        self.output_layer = nn.Linear(hidden_size, output_seq_len)
+        
+    def forward(self, x):
+        batch_size = x.size(0)
+        
+        # Initialize hidden state
+        h0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
+        
+        # Forward through LSTM
+        lstm_out, _ = self.lstm(x, (h0, c0))
+        
+        # Use the last output to predict the entire future sequence
+        last_output = lstm_out[:, -1, :]  # Shape: (batch_size, hidden_size)
+        predictions = self.output_layer(last_output)  # Shape: (batch_size, output_seq_len)
+        
+        # Reshape to match expected output format
+        output = predictions.unsqueeze(-1)  # Shape: (batch_size, output_seq_len, 1)
+        
+        return output
+
+
+class NNPlannerNode(Node):
+    def __init__(self):
+        super().__init__('nn_planner_node')
+
+        # Parameters
+        self.declare_parameter('model_path', '')
+        model_path = self.get_parameter('model_path').get_parameter_value().string_value
+        
+        # Create compatible QoS profile
+        qos_profile = QoSProfile(depth=1)
+        qos_profile.reliability = QoSReliabilityPolicy.BEST_EFFORT
+        qos_profile.history = QoSHistoryPolicy.KEEP_LAST
+        
+        # Publishers
+        self.trajectory_pub = self.create_publisher(
+            Trajectory, "/planning/scenario_planning/trajectory", qos_profile)
+
+        # Subscribers
+        self.kinematic_state_sub = self.create_subscription(
+            Odometry, "/localization/kinematic_state", self.kinematic_state_callback, qos_profile)
+        self.original_trajectory_sub = self.create_subscription(
+            Trajectory, "/planning/scenario_planning/original_trajectory", self.original_trajectory_callback, qos_profile)
+
+        # Node state
+        self.current_odometry = None
+        self.static_path = None
+        self.model = None
+        self.device = torch.device('cpu')  # Use CPU for inference
+        
+        # Feature engineering parameters
+        self.input_seq_len = 149  # Past 3 seconds at 50Hz (149 points)
+        self.output_seq_len = 50  # Future 1 second at 50Hz (50 points)
+        self.feature_buffer = []  # Buffer to store past features
+        
+        self.get_logger().info('NN Planner Node has been initialized.')
+        
+        # Load model
+        if model_path and Path(model_path).exists():
+            self.load_model(model_path)
+        else:
+            self.get_logger().warn(f"Model path not found: {model_path}. Operating in passthrough mode.")
+
+        # Timer to run planner logic
+        self.timer = self.create_timer(0.02, self.planner_callback)  # 50 Hz to match training data
+
+    def load_model(self, model_path):
+        """Load the trained LSTM model."""
+        try:
+            self.get_logger().info(f"Loading model from: {model_path}")
+            
+            # Create model instance
+            self.model = SimplerVelocityLSTM(
+                input_size=13,
+                hidden_size=256,
+                num_layers=2,
+                output_seq_len=self.output_seq_len,
+                dropout=0.2
+            )
+            
+            # Load model data
+            model_data = torch.load(model_path, map_location=self.device)
+            
+            # Check if this is a checkpoint file or direct state_dict
+            if isinstance(model_data, dict) and 'model_state_dict' in model_data:
+                # This is a checkpoint file
+                self.get_logger().info("Loading from checkpoint file...")
+                state_dict = model_data['model_state_dict']
+                if 'epoch' in model_data:
+                    self.get_logger().info(f"Checkpoint from epoch: {model_data['epoch']}")
+                if 'val_loss' in model_data:
+                    self.get_logger().info(f"Validation loss: {model_data['val_loss']:.6f}")
+            else:
+                # This is a direct state_dict
+                self.get_logger().info("Loading from state_dict file...")
+                state_dict = model_data
+            
+            # Load weights
+            self.model.load_state_dict(state_dict)
+            self.model.eval()
+            
+            self.get_logger().info("Model loaded successfully!")
+            
+        except Exception as e:
+            self.get_logger().error(f"Failed to load model: {str(e)}")
+            self.model = None
+
+    def compute_features(self, odometry, trajectory):
+        """
+        Compute 13-dimensional features from current state and trajectory.
+        This is a simplified version - in real implementation, you'd use the full
+        feature engineering from your training data.
+        """
+        try:
+            if not trajectory.points:
+                return None
+                
+            # Extract basic features
+            current_vel_x = odometry.twist.twist.linear.x
+            current_angular_vel_z = odometry.twist.twist.angular.z
+            
+            # Simplified path-relative features (you'd need full implementation)
+            distance_from_centerline = 0.0  # Placeholder
+            heading_error = 0.0  # Placeholder
+            
+            # Simplified curvature features (9 values)
+            curvature_features = [0.0] * 9  # Placeholder
+            
+            # Combine all features
+            features = [
+                current_vel_x,
+                current_angular_vel_z,
+                distance_from_centerline,
+                heading_error
+            ] + curvature_features
+            
+            return np.array(features, dtype=np.float32)
+            
+        except Exception as e:
+            self.get_logger().error(f"Error computing features: {str(e)}")
+            return None
+
+    def run_model_inference(self):
+        """Run LSTM inference to predict future velocities."""
+        try:
+            if self.model is None or len(self.feature_buffer) < self.input_seq_len:
+                return None
+                
+            # Prepare input data
+            input_features = np.array(self.feature_buffer[-self.input_seq_len:])  # Last 149 frames
+            input_tensor = torch.FloatTensor(input_features).unsqueeze(0)  # Add batch dimension
+            
+            # Run inference
+            with torch.no_grad():
+                predictions = self.model(input_tensor)  # Shape: (1, 50, 1)
+                
+            # Extract velocity predictions
+            predicted_velocities = predictions.squeeze().cpu().numpy()  # Shape: (50,)
+            
+            self.get_logger().info(f"Model inference: predicted {len(predicted_velocities)} velocity values", once=True)
+            return predicted_velocities
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in model inference: {str(e)}")
+            return None
+
+    def kinematic_state_callback(self, msg: Odometry):
+        self.current_odometry = msg
+
+    def original_trajectory_callback(self, msg: Trajectory):
+        self.get_logger().info(f"Received static path with {len(msg.points)} points.", once=True)
+        self.static_path = msg
+
+    def planner_callback(self):
+        """Main planner loop."""
+        if self.static_path is None:
+            self.get_logger().info("Waiting for static path...", throttle_duration_sec=5)
+            return
+
+        # For now, we'll work without odometry if it's not available
+        if self.current_odometry is None:
+            self.get_logger().info("No odometry data, using default values...", throttle_duration_sec=5)
+            # Create dummy odometry
+            dummy_odom = Odometry()
+            dummy_odom.twist.twist.linear.x = 4.0  # Default speed
+            dummy_odom.twist.twist.angular.z = 0.0
+            self.current_odometry = dummy_odom
+
+        # Compute features and update buffer
+        features = self.compute_features(self.current_odometry, self.static_path)
+        if features is not None:
+            self.feature_buffer.append(features)
+            # Keep only the required sequence length
+            if len(self.feature_buffer) > self.input_seq_len:
+                self.feature_buffer.pop(0)
+
+        # Create output trajectory
+        output_trajectory = Trajectory()
+        output_trajectory.header.stamp = self.get_clock().now().to_msg()
+        output_trajectory.header.frame_id = "map"
+        
+        # Copy points from static path
+        output_trajectory.points = self.static_path.points.copy()
+
+        # Try to run model inference if we have enough data
+        if self.model is not None and len(self.feature_buffer) >= self.input_seq_len:
+            predicted_velocities = self.run_model_inference()
+            
+            if predicted_velocities is not None:
+                # Apply predicted velocities to trajectory points
+                for i, point in enumerate(output_trajectory.points):
+                    if i < len(predicted_velocities):
+                        # Apply model prediction
+                        point.longitudinal_velocity_mps = float(predicted_velocities[i])
+                    else:
+                        # Keep original velocity for points beyond prediction horizon
+                        pass  # Keep original velocity
+                        
+                self.get_logger().info(f"Applied ML predictions to trajectory", throttle_duration_sec=5)
+            else:
+                self.get_logger().info(f"Using original velocities (inference failed)", throttle_duration_sec=5)
+        else:
+            self.get_logger().info(f"Using original velocities (insufficient data or no model)", throttle_duration_sec=5)
+        
+        # Publish the trajectory
+        self.trajectory_pub.publish(output_trajectory)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = NNPlannerNode()
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("Shutting down NN Planner Node...")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main() 

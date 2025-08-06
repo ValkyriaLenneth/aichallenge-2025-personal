@@ -26,6 +26,10 @@ RUN echo 'export PS1="\[\e]0;(AIC_DEV) ${debian_chroot:+($debian_chroot)}\u@\h: 
 RUN echo 'cd /aichallenge' >> /etc/skel/.bashrc
 ENV RCUTILS_COLORIZED_OUTPUT=1
 
+# Install pip and PyTorch for the development environment
+RUN apt-get update && apt-get install -y python3-pip ros-humble-lanelet2-io
+RUN pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
 FROM common AS eval
 
 ENV RCUTILS_COLORIZED_OUTPUT=0

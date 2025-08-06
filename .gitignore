@@ -1,1 +1,102 @@
-*details.json
+# ======================================================================================
+# AI Challenge 2025 Development - GitIgnore
+# ======================================================================================
+
+# ROS2 Build artifacts
+aichallenge/build/
+aichallenge/install/
+aichallenge/log/
+aichallenge/workspace/build/
+aichallenge/workspace/install/
+aichallenge/workspace/log/
+
+# Output and logging files
+output/
+*.log
+*.bag
+*.mcap
+
+# Training data and models (keep training scripts, exclude large data files)
+aichallenge/nn_planner_dev/data/
+aichallenge/nn_planner_dev/training_output/
+aichallenge/nn_planner_dev/*.csv
+aichallenge/nn_planner_dev/*.npy
+aichallenge/nn_planner_dev/*.pkl
+
+# Visualization outputs
+aichallenge/workspace/src/aichallenge_submit/simple_trajectory_generator/data/visualizations_*/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.avi
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.pytest_cache/
+
+# PyTorch model files (large binary files)
+*.pth
+*.pt
+*.onnx
+
+# Temporary and backup files
+*.tmp
+*.temp
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# IDE and editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Environment and configuration
+.env
+.env.local
+.env.*.local
+
+# Analysis and temporary scripts (keep important ones)
+analyze_lstm_log.py
+analyze_paths.py
+test_*.py
+fix_*.py
+
+# Docker volumes and cache
+.docker/
+
+# ROS specific
+devel/
+logs/
+.catkin_workspace
+
+# Large data files
+*.csv
+!**/data/raceline_awsim.csv  # Keep original raceline
+!aichallenge/workspace/src/aichallenge_submit/simple_trajectory_generator/data/raceline_awsim.csv
+
+# Backup and versioned files
+*.bak
+*.backup
+*_backup*
+*_old*
+*_v[0-9]*
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

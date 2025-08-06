@@ -1,0 +1,351 @@
+大会官方：
+提供了一个简单的路径发布器，它每1s发布读取的csv路径到系统中，供下游的controller使用。
+
+我们的目标：
+1，使用官方的csv路径中的坐标信息
+2，使用lstm模型来发布速度信息
+3，使用sac算法进行速度的训练
+
+当前遇到的问题：
+我们编写了aichallenge/nn_planner_dev这个模型载入器，并集成到了系统中，发现它可以正常运行。
+在此基础上，我们编写了aichallenge/sac_gym_env这个SAC训练环境，但是发现它存在以下问题：
+路径并没有按照原始CSV中的路径去走，而是每次都会偏移。
+
+由于我们无论如何努力都解决不了这个问题，现在只能重构代码。
+
+现在我希望采用小步快走的方式，来stepbystep的解决问题。
+
+1， 创建一个新的节点 new-sac-gym-env，取代之前的sac_gym_env, 并修改launch.xml以将这个新的节点集成进去。
+2， 最初始化版本的这个节点只有一个功能，和之前的nn planner node一样，加载lstm模型pth文件，并发布速度。
+3， 在确认2可行之后，引入SAC的训练逻辑，也就是实际的状态，action，奖励函数等的定义。确认其正常运行。
+4. 在3也完成之后，再引入重置系统，也就是当出现撞车的时候，重启AWSIM，开启新的episode.
+
+参考文档：aichallenge/nn_planner_dev/NN_Planner_Development.md
+aichallenge/nn_planner_dev/task.md
+aichallenge/nn_planner_dev/dev_note.md
+
+@开发备案文档.txt 
+按照开发文档，我们现在已经完成阶段1和2的任务。
+但是我需要在这个阶段就解决的一个问题是：
+下游的控制器：@simple_pure_pursuit 实际上接受的是一个全局路径点。
+而我们当前的@new_sac_gym_env 模型推理的是一个局部的路径点。
+
+我详细点来说明：
+在大会官方的原始方案中，simple trajectory generator会定期发布整个地图的路径，也就是csv中定义的。
+而我们的LSTM训练逻辑，则是从ros2 bag record命令中读取到的实际数据来进行训练的。也就是说，lstm输出的是未来50个autoware topic时钟值，而不是simple trajectory generator发布的路径
+
+当前系统架构的数据流：
+官方方案：simple_trajectory_generator 每1秒发布整个CSV路径（~1000+个点）到 /planning/scenario_planning/original_trajectory
+您的LSTM方案：new_sac_gym_env 接收这个全局路径，但LSTM模型预测的是未来50个时间步长的速度值（基于ROS2 bag数据训练）
+下游控制器：simple_pure_pursuit 需要接收一个完整的轨迹路径（包含坐标和速度）
+核心矛盾：
+空间域 vs 时间域：CSV路径是空间采样的（按距离间隔），而LSTM输出是时间采样的（按时间间隔）
+全局 vs 局部：Pure pursuit需要全局路径进行look-ahead，但LSTM只输出局部的未来50个时间步
+
+好的，让我从原理层面详细解释方案1的核心思想和实现机制。
+
+## 方案1核心原理详解
+
+### 1. 时空域映射的数学基础
+
+#### 1.1 空间域与时间域的转换关系
+
+**空间域采样（CSV路径）**：
+- 路径点按固定距离间隔采样：`s₀, s₁, s₂, ..., sₙ`
+- 每个点包含：位置 `(x, y, z)` 和参考速度 `v_ref`
+- 点间距通常为 1-2 米
+
+**时间域预测（LSTM输出）**：
+- 按固定时间间隔预测：`t₀, t₁, t₂, ..., t₅₀` (假设dt=0.1s，共5秒预测)
+- 每个时刻输出速度：`v₀, v₁, v₂, ..., v₅₀`
+
+**转换核心公式**：
+```
+空间距离 = ∫ v(t) dt ≈ Σ v_i × dt
+```
+
+### 1.2 映射算法详解
+
+```python
+def time_to_space_mapping(predicted_velocities, current_position, dt=0.1):
+    """
+    将时间域的速度预测转换为空间域的路径点
+    
+    输入：
+    - predicted_velocities: [v₀, v₁, ..., v₄₉] 长度50的速度数组
+    - current_position: 当前车辆位置在全局路径中的索引
+    - dt: 时间步长
+    
+    输出：
+    - space_velocity_map: {路径点索引: 预测速度} 的映射关系
+    """
+    
+    # 1. 计算累积行驶距离
+    cumulative_distances = [0]
+    for i, velocity in enumerate(predicted_velocities):
+        distance_increment = velocity * dt
+        cumulative_distances.append(cumulative_distances[-1] + distance_increment)
+    
+    # 2. 将累积距离映射到全局路径的空间点
+    space_velocity_map = {}
+    for i, total_distance in enumerate(cumulative_distances[1:]):  # 跳过起始点
+        # 在全局路径上找到距离当前位置total_distance的点
+        target_space_index = find_path_point_at_distance(
+            global_path, current_position, total_distance
+        )
+        if target_space_index is not None:
+            space_velocity_map[target_space_index] = predicted_velocities[i]
+    
+    return space_velocity_map
+```
+
+### 2. 智能拼接策略
+
+#### 2.1 分区域处理原理
+
+将全局路径分为三个区域：
+
+```
+|----已过区域----|----LSTM覆盖区域----|----原始CSV区域----|
+     (保持)           (LSTM预测)         (CSV参考速度)
+```
+
+**区域定义**：
+- **已过区域**：车辆后方的路径点，保持原始状态
+- **LSTM覆盖区域**：车辆前方200米范围，使用LSTM预测速度
+- **原始CSV区域**：更远距离的路径点，保持CSV原始速度
+
+#### 2.2 平滑过渡算法
+
+为避免速度突变，在区域边界处进行平滑过渡：
+
+```python
+def smooth_velocity_transition(lstm_velocities, csv_velocities, transition_length=20):
+    """
+    在LSTM预测区域和CSV原始区域之间进行平滑过渡
+    
+    参数：
+    - lstm_velocities: LSTM预测的速度序列
+    - csv_velocities: CSV原始速度序列  
+    - transition_length: 过渡区域长度（路径点数）
+    """
+    
+    # 使用加权平均进行平滑过渡
+    smoothed_velocities = []
+    
+    for i in range(transition_length):
+        # 计算权重：从LSTM权重1逐渐过渡到CSV权重1
+        lstm_weight = (transition_length - i) / transition_length
+        csv_weight = i / transition_length
+        
+        # 加权混合
+        mixed_velocity = lstm_weight * lstm_velocities[i] + csv_weight * csv_velocities[i]
+        smoothed_velocities.append(mixed_velocity)
+    
+    return smoothed_velocities
+```
+
+### 3. 实时更新机制
+
+#### 3.1 滑动窗口原理
+
+```
+时刻 t:   |--LSTM预测窗口(50步)--|
+时刻 t+1:    |--LSTM预测窗口(50步)--|
+时刻 t+2:       |--LSTM预测窗口(50步)--|
+```
+
+每个控制周期（0.1秒），预测窗口向前滑动，需要重新计算时空映射。
+
+#### 3.2 增量更新算法
+
+```python
+class AdaptiveVelocityPlanner:
+    def __init__(self):
+        self.velocity_cache = {}  # 缓存已计算的速度映射
+        self.last_update_position = None
+        
+    def update_velocity_mapping(self, current_position, lstm_predictions):
+        """
+        增量更新速度映射，避免重复计算
+        """
+        
+        # 检查是否需要更新
+        if self.should_update(current_position):
+            # 清理过期的缓存数据
+            self.cleanup_expired_cache(current_position)
+            
+            # 计算新的映射关系
+            new_mapping = self.compute_new_mapping(current_position, lstm_predictions)
+            
+            # 更新缓存
+            self.velocity_cache.update(new_mapping)
+            self.last_update_position = current_position
+            
+        return self.get_current_trajectory()
+```
+
+### 4. 处理边界情况
+
+#### 4.1 速度不连续问题
+
+**问题**：LSTM预测的第一个速度值可能与当前实际速度差异较大
+
+**解决方案**：
+```python
+def ensure_velocity_continuity(current_velocity, predicted_velocities, max_accel=2.0, dt=0.1):
+    """
+    确保速度序列的物理可行性
+    """
+    corrected_velocities = [current_velocity]  # 起始速度为当前实际速度
+    
+    for i, predicted_v in enumerate(predicted_velocities):
+        last_v = corrected_velocities[-1]
+        
+        # 计算允许的最大速度变化
+        max_delta_v = max_accel * dt
+        
+        # 限制速度变化率
+        if abs(predicted_v - last_v) > max_delta_v:
+            if predicted_v > last_v:
+                corrected_v = last_v + max_delta_v
+            else:
+                corrected_v = last_v - max_delta_v
+        else:
+            corrected_v = predicted_v
+            
+        corrected_velocities.append(corrected_v)
+    
+    return corrected_velocities[1:]  # 返回除当前速度外的预测序列
+```
+
+#### 4.2 路径终点处理
+
+**问题**：当车辆接近路径终点时，LSTM预测可能超出路径范围
+
+**解决方案**：
+```python
+def handle_path_boundary(global_path, current_position, predicted_mapping):
+    """
+    处理路径边界情况
+    """
+    max_path_index = len(global_path) - 1
+    
+    # 过滤超出路径范围的映射
+    valid_mapping = {
+        idx: velocity for idx, velocity in predicted_mapping.items()
+        if idx <= max_path_index
+    }
+    
+    # 如果预测窗口超出路径，在终点附近进行减速处理
+    if max(predicted_mapping.keys()) > max_path_index:
+        # 计算到终点的距离
+        distance_to_end = calculate_distance_to_path_end(current_position, global_path)
+        
+        # 应用减速策略
+        if distance_to_end < 50:  # 距离终点50米内开始减速
+            apply_deceleration_strategy(valid_mapping, distance_to_end)
+    
+    return valid_mapping
+```
+
+### 5. 系统性能优化
+
+#### 5.1 计算复杂度分析
+
+- **时间复杂度**：O(n + m)，其中n为LSTM预测步数（50），m为影响范围内的路径点数（~200）
+- **空间复杂度**：O(m)，主要存储速度映射关系
+
+#### 5.2 实时性保证
+
+```python
+class RealTimePlanner:
+    def __init__(self):
+        self.computation_budget = 0.05  # 50ms计算预算
+        self.fallback_strategy = "use_csv_velocity"
+        
+    def plan_with_timeout(self, lstm_predictions):
+        """
+        带超时保护的规划算法
+        """
+        start_time = time.time()
+        
+        try:
+            # 执行主要的时空映射算法
+            result = self.main_planning_algorithm(lstm_predictions)
+            
+            # 检查计算时间
+            if time.time() - start_time > self.computation_budget:
+                self.get_logger().warn("Planning computation exceeded budget, consider optimization")
+            
+            return result
+            
+        except Exception as e:
+            # 降级到备用策略
+            self.get_logger().error(f"Planning failed: {e}, using fallback strategy")
+            return self.execute_fallback_strategy()
+```
+
+### 6. 与SAC训练的兼容性
+
+这个方案为后续的SAC训练提供了良好的基础：
+
+1. **状态空间设计**：当前位置、速度、路径曲率等特征易于提取
+2. **动作空间定义**：可以直接使用速度调整量作为动作
+3. **奖励函数计算**：基于路径跟踪误差、速度平滑性等指标
+
+通过这种时空域映射的方法，我们既保持了系统的实时性，又充分利用了LSTM的预测能力，为整个自动驾驶系统提供了一个稳定、高效的速度规划解决方案。
+
+
+这是一个很好的问题！让我解释一下为什么会出现这种重复代码的情况，以及ROS2包的两种不同部署方式：
+ROS2包的两种可执行文件部署方式
+方式1：Entry Points（推荐的现代方式）
+Apply to planner
+工作原理：Python包管理器会自动生成一个可执行脚本，该脚本调用模块中的函数
+文件位置：install/lib/new_sac_gym_env/planner（自动生成）
+源代码：new_sac_gym_env/planner_node.py
+方式2：Scripts目录（传统方式）
+Apply to planner
+工作原理：直接复制脚本文件到安装目录
+文件位置：scripts/planner（手动维护）
+源代码：scripts/planner本身就是完整的可执行代码
+为什么会出现重复？
+这个包设计存在几个问题：
+历史遗留：可能最初使用的是scripts方式，后来想改为entry points方式，但没有删除旧文件
+开发者不确定：可能开发者不确定哪种方式会被实际使用，所以保留了两种
+构建系统混乱：setup.py中的CustomInstallCommand试图将两种方式结合，这很容易出错
+实际运行的是哪个文件？
+从我检查setup.py可以看出，实际的安装逻辑是：
+这个CustomInstallCommand试图将entry point生成的可执行文件复制到lib/package_name/目录。但实际上：
+Entry point会自动生成：install/lib/new_sac_gym_env/planner（调用planner_node.py）
+Scripts会被复制：scripts/planner可能也会被安装
+现在让我检查一下实际安装后的文件：
+找到问题了！
+安装的可执行文件是一个符号链接，直接指向scripts/planner，而不是我们修改的planner_node.py！
+Apply to planner
+这说明：
+实际运行的是：scripts/planner文件
+我们修改的：new_sac_gym_env/planner_node.py（没有被使用）
+解决方案
+我们需要将时空域映射的代码更新到scripts/planner文件中。让我现在就做这个更新：
+
+总结答案
+关于为什么会有两个文件的问题：
+原因分析
+ROS2包的两种部署方式混合使用：
+Entry Points方式（现代）：通过setup.py中的entry_points自动生成可执行文件
+Scripts方式（传统）：直接复制脚本文件到安装目录
+实际运行的是scripts/planner：
+安装后的可执行文件是一个符号链接，直接指向scripts/planner
+我们之前修改的new_sac_gym_env/planner_node.py实际上没有被使用
+设计问题：
+包的设计者可能想同时支持两种方式，但配置不当
+CustomInstallCommand试图将两种方式结合，但结果是符号链接指向了脚本文件
+解决方案
+现在我已经将时空域映射的完整功能同步到了scripts/planner文件中，包括：
+详细的调试日志输出
+时空域映射算法
+速度连续性检查
+混合轨迹创建
+后备轨迹机制
+现在重新编译运行，应该能看到我们期待的时空域映射调试信息了。
