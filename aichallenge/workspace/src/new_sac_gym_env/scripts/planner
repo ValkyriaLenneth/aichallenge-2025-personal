@@ -8,11 +8,287 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy.spatial.transform import Rotation as R
 import time
+from collections import deque
+from gymnasium import spaces
 
 from nav_msgs.msg import Odometry
 from autoware_auto_planning_msgs.msg import Trajectory
+
+# ======================================================================================
+# SAC Components - Neural Networks
+# ======================================================================================
+
+class SACActorNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
+        super().__init__()
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        
+        # 策略网络 - 输出均值和标准差
+        self.mean_head = nn.Linear(hidden_dim, action_dim)
+        self.log_std_head = nn.Linear(hidden_dim, action_dim)
+        
+    def forward(self, state):
+        features = self.feature_extractor(state)
+        mean = self.mean_head(features)
+        log_std = self.log_std_head(features)
+        log_std = torch.clamp(log_std, -20, 2)  # 限制标准差范围
+        return mean, log_std
+
+class SACCriticNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
+        super().__init__()
+        self.q1 = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), 
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        self.q2 = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim),
+            nn.ReLU(), 
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+    def forward(self, state, action):
+        sa = torch.cat([state, action], dim=-1)
+        return self.q1(sa), self.q2(sa)
+
+# ======================================================================================
+# SAC Components - Managers and Logger
+# ======================================================================================
+
+class SACStateManager:
+    def __init__(self):
+        # 观测空间：(90, 13) - 90个时间步，每步13个特征
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, 
+            shape=(90, 13), 
+            dtype=np.float32
+        )
+        self.sequence_length = 90
+        self.observation_buffer = deque(maxlen=self.sequence_length)
+        
+    def extract_state_features(self, features):
+        """将13维特征向量添加到观测缓冲区并返回完整状态"""
+        # 添加当前特征到缓冲区
+        self.observation_buffer.append(features)
+        
+        # 如果缓冲区未满，用零填充
+        while len(self.observation_buffer) < self.sequence_length:
+            self.observation_buffer.append(np.zeros(13, dtype=np.float32))
+        
+        # 转换为numpy数组并展平
+        state_sequence = np.array(list(self.observation_buffer))
+        return state_sequence.flatten()  # shape: (90 * 13,)
+
+class SACActionManager:
+    def __init__(self):
+        # 动作空间：连续的目标速度
+        self.action_space = spaces.Box(
+            low=0.0, high=10.0, 
+            shape=(1,), 
+            dtype=np.float32
+        )
+        
+    def process_action(self, action):
+        """处理SAC输出的动作，转换为目标速度"""
+        target_velocity = float(action[0])
+        # 添加物理约束检查
+        target_velocity = np.clip(target_velocity, 0.0, 10.0)
+        return target_velocity
+
+class SACRewardCalculator:
+    def __init__(self):
+        # 调整后的奖励权重
+        self.W_PROGRESS = 3.0      # 强化速度奖励权重 (从1.0增加到3.0)
+        self.W_CENTER = 2.0        # 中线保持平衡一点 (从5.0降低到2.0)
+        self.W_SMOOTHNESS = 0.1    # 速度平滑性权重
+        self.W_EFFICIENCY = 1.0    # 新增：速度效率奖励
+        self.MAX_DIST_FROM_CENTER = 3.0
+        
+        # 奖励统计
+        self.reward_history = []
+        self.component_rewards = {
+            'progress': [],
+            'lane_keeping': [],
+            'smoothness': [],
+            'efficiency': []
+        }
+        
+    def calculate_reward(self, state_info, action, next_state_info=None):
+        """计算奖励函数并记录详细统计"""
+        current_velocity = state_info['velocity']
+        distance_from_centerline = state_info['distance_from_centerline']
+        target_velocity = action[0]
+        
+        # 1. 进度奖励：强化速度奖励，鼓励更快的前进
+        reward_progress = self.W_PROGRESS * current_velocity
+        if current_velocity > 5.0:  # 额外奖励高速行驶
+            reward_progress += 0.5 * (current_velocity - 5.0)
+        
+        # 2. 中线保持奖励：平衡的惩罚，不过分严格
+        reward_lane_keeping = -self.W_CENTER * (distance_from_centerline ** 2)
+        
+        # 3. 速度平滑性奖励：避免剧烈的速度变化
+        if hasattr(self, 'last_target_velocity'):
+            velocity_change = abs(target_velocity - self.last_target_velocity)
+            reward_smoothness = -self.W_SMOOTHNESS * velocity_change
+        else:
+            reward_smoothness = 0.0
+        self.last_target_velocity = target_velocity
+        
+        # 4. 新增：速度效率奖励（接近目标速度的奖励）
+        if 'target_speed' in state_info:
+            speed_error = abs(current_velocity - state_info['target_speed'])
+            reward_efficiency = -self.W_EFFICIENCY * speed_error
+        else:
+            reward_efficiency = 0.0
+        
+        # 记录各组件奖励
+        self.component_rewards['progress'].append(reward_progress)
+        self.component_rewards['lane_keeping'].append(reward_lane_keeping)
+        self.component_rewards['smoothness'].append(reward_smoothness)
+        self.component_rewards['efficiency'].append(reward_efficiency)
+        
+        total_reward = reward_progress + reward_lane_keeping + reward_smoothness + reward_efficiency
+        
+        # 终止条件检查
+        terminated = abs(distance_from_centerline) > self.MAX_DIST_FROM_CENTER
+        if terminated:
+            total_reward -= 200  # 严重惩罚
+            
+        self.reward_history.append(total_reward)
+        
+        return total_reward, terminated, {
+            'reward_progress': reward_progress,
+            'reward_lane_keeping': reward_lane_keeping,
+            'reward_smoothness': reward_smoothness,
+            'reward_efficiency': reward_efficiency,
+            'total_reward': total_reward
+        }
+
+class SACLogger:
+    def __init__(self, node_logger):
+        self.logger = node_logger
+        self.step_count = 0
+        self.log_interval = 10  # 每10步详细日志一次
+        self.summary_interval = 100  # 每100步统计日志一次
+        
+        # 统计数据
+        self.metrics_history = {
+            'actor_loss': [],
+            'critic_loss': [],
+            'q1_values': [],
+            'q2_values': [],
+            'actions': [],
+            'rewards': [],
+            'computation_time': []
+        }
+    
+    def log_sac_initialization(self, components):
+        """记录SAC组件初始化"""
+        self.logger.info("=" * 80)
+        self.logger.info("🚀 SAC COMPONENTS INITIALIZATION")
+        self.logger.info("=" * 80)
+        
+        for name, component in components.items():
+            if hasattr(component, 'parameters'):
+                param_count = sum(p.numel() for p in component.parameters())
+                self.logger.info(f"✅ {name.upper()}: {param_count:,} parameters")
+            else:
+                self.logger.info(f"✅ {name.upper()}: Initialized")
+        
+        self.logger.info("=" * 80)
+    
+    def log_step_details(self, step_data):
+        """记录每步的详细信息"""
+        self.step_count += 1
+        
+        if self.step_count % self.log_interval == 0:
+            self.logger.info("─" * 60)
+            self.logger.info(f"📊 SAC STEP {self.step_count} DETAILS")
+            self.logger.info("─" * 60)
+            
+            # Actor信息
+            self.logger.info(f"🎭 ACTOR:")
+            self.logger.info(f"   Action Mean: {step_data['action_mean']:.4f}")
+            self.logger.info(f"   Action Std:  {step_data['action_std']:.4f}")
+            self.logger.info(f"   Final Action: {step_data['final_action']:.4f}")
+            self.logger.info(f"   Action Range: [{step_data['action_min']:.4f}, {step_data['action_max']:.4f}]")
+            
+            # Critic信息
+            self.logger.info(f"🏛️ CRITIC:")
+            self.logger.info(f"   Q1 Value: {step_data['q1_value']:.4f}")
+            self.logger.info(f"   Q2 Value: {step_data['q2_value']:.4f}")
+            self.logger.info(f"   Target Q1: {step_data['target_q1']:.4f}")
+            self.logger.info(f"   Target Q2: {step_data['target_q2']:.4f}")
+            self.logger.info(f"   Min Q Value: {min(step_data['q1_value'], step_data['q2_value']):.4f}")
+            
+            # 奖励详情
+            if 'reward_components' in step_data:
+                self.logger.info(f"🎯 REWARD BREAKDOWN:")
+                for comp, value in step_data['reward_components'].items():
+                    self.logger.info(f"   {comp}: {value:.4f}")
+            
+            # 状态信息
+            if 'state_info' in step_data:
+                self.logger.info(f"🚗 VEHICLE STATE:")
+                self.logger.info(f"   Velocity: {step_data['state_info']['velocity']:.3f} m/s")
+                self.logger.info(f"   Distance from Center: {step_data['state_info']['distance_from_centerline']:.3f} m")
+                self.logger.info(f"   Heading Error: {step_data['state_info'].get('heading_error', 0):.3f} rad")
+            
+            # 性能信息
+            self.logger.info(f"⚡ PERFORMANCE:")
+            self.logger.info(f"   Computation Time: {step_data['computation_time']:.4f} s")
+            self.logger.info(f"   Memory Usage: {step_data.get('memory_usage', 'N/A')}")
+    
+    def log_loss_details(self, loss_data):
+        """记录损失函数详细信息"""
+        self.logger.info(f"📉 LOSS CALCULATION:")
+        self.logger.info(f"   Actor Loss: {loss_data['actor_loss']:.6f}")
+        self.logger.info(f"   Critic Loss: {loss_data['critic_loss']:.6f}")
+        self.logger.info(f"   TD Error: {loss_data.get('td_error', 'N/A'):.6f}")
+        self.logger.info(f"   Policy Entropy: {loss_data.get('entropy', 'N/A'):.6f}")
+        
+        # 记录到历史
+        self.metrics_history['actor_loss'].append(loss_data['actor_loss'])
+        self.metrics_history['critic_loss'].append(loss_data['critic_loss'])
+    
+    def log_statistics_summary(self):
+        """记录统计摘要"""
+        if self.step_count % self.summary_interval == 0:
+            self.logger.info("📈 PERFORMANCE STATISTICS SUMMARY:")
+            
+            for metric, values in self.metrics_history.items():
+                if values:
+                    recent_values = values[-self.summary_interval:]
+                    self.logger.info(f"   {metric.upper()} (last {len(recent_values)} steps):")
+                    self.logger.info(f"      Mean: {np.mean(recent_values):.6f}")
+                    self.logger.info(f"      Std:  {np.std(recent_values):.6f}")
+                    self.logger.info(f"      Min:  {np.min(recent_values):.6f}")
+                    self.logger.info(f"      Max:  {np.max(recent_values):.6f}")
+    
+    def log_error(self, error_msg, exception=None):
+        """记录错误信息"""
+        self.logger.error(f"❌ SAC ERROR: {error_msg}")
+        if exception:
+            self.logger.error(f"   Exception: {str(exception)}")
+    
+    def log_warning(self, warning_msg):
+        """记录警告信息"""
+        self.logger.warn(f"⚠️ SAC WARNING: {warning_msg}")
 
 # ======================================================================================
 # Model Definition (正确的训练模型架构)
@@ -73,14 +349,19 @@ class SimplerVelocityLSTM(nn.Module):
         return output
 
 # ======================================================================================
-# Neural Network Planner Node with Time-Space Domain Mapping
+# Neural Network Planner Node with Time-Space Domain Mapping + SAC Components
 # ======================================================================================
 
 class NNPlannerNode(Node):
     def __init__(self):
         super().__init__('new_sac_gym_env_node')
         
-        self.get_logger().info("NN Planner Node initializing with Time-Space Domain Mapping...")
+        self.get_logger().info("🎯 Starting SAC Integration Phase...")
+        self.get_logger().info(f"📊 Adjusted Reward Weights:")
+        self.get_logger().info(f"   Progress Weight: 3.0 (强化速度奖励)")
+        self.get_logger().info(f"   Center Weight: 2.0 (平衡中线保持)")
+        self.get_logger().info(f"   Smoothness Weight: 0.1")
+        self.get_logger().info(f"   Efficiency Weight: 1.0 (新增)")
         
         # 时空域映射参数
         self.prediction_horizon_meters = self.declare_parameter('prediction_horizon_meters', 200.0).value
@@ -89,6 +370,10 @@ class NNPlannerNode(Node):
         self.max_acceleration = self.declare_parameter('max_acceleration', 2.0).value
         self.enable_velocity_constraints = False  # 关闭速度连续性约束
         self.enable_debug_logs = self.declare_parameter('enable_debug_logs', False).value  # 默认关闭调试日志
+        
+        # SAC相关参数
+        self.enable_sac_calculation = self.declare_parameter('enable_sac_calculation', True).value
+        self.sac_debug_logging = self.declare_parameter('sac_debug_logging', True).value
         
         # 调试日志计数器
         self.debug_log_counter = 0
@@ -104,6 +389,9 @@ class NNPlannerNode(Node):
             self.get_logger().info(f"Max acceleration: {self.max_acceleration} m/s²")
         else:
             self.get_logger().info("Velocity continuity constraints: DISABLED")
+            
+        self.get_logger().info(f"SAC calculation: {'ENABLED' if self.enable_sac_calculation else 'DISABLED'}")
+        self.get_logger().info(f"SAC debug logging: {'ENABLED' if self.sac_debug_logging else 'DISABLED'}")
 
         # Load model - 使用正确的模型架构
         model_path = self.declare_parameter('model_path', '/aichallenge/nn_planner_dev/training_output/best_model.pth').value
@@ -123,6 +411,11 @@ class NNPlannerNode(Node):
         self.model.to(self.device)
         self.model.eval()
         self.get_logger().info("--- LSTM model loaded successfully and set to evaluation mode. ---")
+
+        # SAC组件初始化
+        if self.enable_sac_calculation:
+            self.sac_components = self._initialize_sac_components()
+            self.training_mode = False  # 此阶段不实际训练
 
         # 修复QoS兼容性问题
         # 使用BEST_EFFORT可靠性策略以匹配发布者
@@ -154,11 +447,80 @@ class NNPlannerNode(Node):
         # Create a timer that attempts to plan and publish
         self.create_timer(0.1, self.planner_callback)  # 10Hz planning
         
+        self.get_logger().info("🚀 SAC Integration Phase Complete - Ready for detailed monitoring!")
         self.get_logger().info("NN Planner Node initialized successfully")
+
+    def _initialize_sac_components(self):
+        """初始化SAC相关组件（增强版）"""
+        self.get_logger().info("🚀 Initializing SAC components...")
+        
+        state_dim = 90 * 13  # 展平后的状态维度
+        action_dim = 1
+        
+        components = {
+            'state_manager': SACStateManager(),
+            'action_manager': SACActionManager(), 
+            'reward_calculator': SACRewardCalculator(),
+            'actor': SACActorNetwork(state_dim, action_dim).to(self.device),
+            'critic1': SACCriticNetwork(state_dim, action_dim).to(self.device),
+            'critic2': SACCriticNetwork(state_dim, action_dim).to(self.device),
+            'target_critic1': SACCriticNetwork(state_dim, action_dim).to(self.device),
+            'target_critic2': SACCriticNetwork(state_dim, action_dim).to(self.device),
+        }
+        
+        # 初始化目标网络
+        components['target_critic1'].load_state_dict(components['critic1'].state_dict())
+        components['target_critic2'].load_state_dict(components['critic2'].state_dict())
+        
+        # 初始化日志系统
+        self.sac_logger = SACLogger(self.get_logger())
+        self.sac_logger.log_sac_initialization(components)
+        
+        # 验证组件
+        self._validate_sac_components(components)
+        
+        return components
+
+    def _validate_sac_components(self, components):
+        """验证SAC组件的正确性"""
+        self.get_logger().info("🔍 Validating SAC components...")
+        
+        try:
+            # 测试状态维度
+            dummy_state = torch.randn(1, 90 * 13).to(self.device)
+            dummy_action = torch.randn(1, 1).to(self.device)
+            
+            # 测试Actor
+            mean, log_std = components['actor'](dummy_state)
+            assert mean.shape == (1, 1), f"Actor output shape error: {mean.shape}"
+            self.get_logger().info("✅ Actor validation passed")
+            
+            # 测试Critic
+            q1, q2 = components['critic1'](dummy_state, dummy_action)
+            assert q1.shape == (1, 1), f"Critic output shape error: {q1.shape}"
+            self.get_logger().info("✅ Critic validation passed")
+            
+            # 测试奖励计算
+            dummy_state_info = {
+                'velocity': 5.0,
+                'distance_from_centerline': 0.5,
+                'heading_error': 0.1
+            }
+            reward, terminated, components_reward = components['reward_calculator'].calculate_reward(
+                dummy_state_info, [5.0], dummy_state_info
+            )
+            assert isinstance(reward, (int, float)), "Reward calculation failed"
+            self.get_logger().info("✅ Reward calculation validation passed")
+            
+            self.get_logger().info("🎉 All SAC components validated successfully!")
+            
+        except Exception as e:
+            self.sac_logger.log_error("SAC component validation failed", e)
+            raise
 
     def planner_callback(self):
         """
-        使用时空域映射+路径拼接的主规划回调函数
+        使用时空域映射+路径拼接的主规划回调函数，增加SAC计算
         """
         self.planning_start_time = time.time()
         
@@ -193,6 +555,10 @@ class NNPlannerNode(Node):
 
             # 发布轨迹
             self.trajectory_pub.publish(hybrid_trajectory)
+
+            # SAC计算（不实际训练）
+            if self.enable_sac_calculation:
+                self._run_sac_calculation()
 
         except Exception as e:
             self.get_logger().error(f"Planning failed: {e}")
@@ -459,6 +825,260 @@ class NNPlannerNode(Node):
             if not hasattr(self, '_path_loaded'):
                 self.get_logger().info(f"Static path loaded with {len(self.static_path_pts)} points")
                 self._path_loaded = True
+
+    def _run_sac_calculation(self):
+        """运行SAC计算流程（增强日志版本）"""
+        start_time = time.time()
+        
+        try:
+            # 1. 状态提取
+            current_state = self._extract_sac_state()
+            if current_state is None:
+                if self.sac_debug_logging:
+                    self.sac_logger.log_warning("State extraction failed - skipping SAC calculation")
+                return
+                
+            # 2. Actor前向传播
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(current_state).unsqueeze(0).to(self.device)
+                
+                # 调试信息
+                if self.sac_debug_logging and hasattr(self, 'debug_step_counter'):
+                    if not hasattr(self, 'debug_step_counter'):
+                        self.debug_step_counter = 0
+                    self.debug_step_counter += 1
+                    if self.debug_step_counter % 50 == 1:  # 每50步打印一次
+                        self.get_logger().info(f"Actor input shape: {state_tensor.shape}")
+                
+                mean, log_std = self.sac_components['actor'](state_tensor)
+                std = log_std.exp()
+                
+                # 采样动作
+                normal = torch.distributions.Normal(mean, std)
+                action_sample = normal.rsample()
+                action = torch.tanh(action_sample) * 5.0 + 5.0  # 映射到[0,10]
+                
+                # 调试动作形状
+                if self.sac_debug_logging and hasattr(self, 'debug_step_counter') and self.debug_step_counter % 50 == 1:
+                    self.get_logger().info(f"Action shapes - mean: {mean.shape}, action: {action.shape}")
+                
+                # 计算动作统计
+                action_stats = {
+                    'action_mean': mean.item(),
+                    'action_std': std.item(),
+                    'final_action': action.item(),
+                    'action_min': 0.0,
+                    'action_max': 10.0
+                }
+                
+            # 3. Critic前向传播
+            with torch.no_grad():
+                q1, q2 = self.sac_components['critic1'](state_tensor, action)
+                target_q1, target_q2 = self.sac_components['target_critic1'](state_tensor, action)
+                
+                critic_stats = {
+                    'q1_value': q1.item(),
+                    'q2_value': q2.item(),
+                    'target_q1': target_q1.item(),
+                    'target_q2': target_q2.item()
+                }
+                
+            # 4. 状态信息提取
+            state_info = self._extract_state_info()
+            
+            # 5. 奖励计算
+            reward, terminated, reward_components = self.sac_components['reward_calculator'].calculate_reward(
+                state_info, action.cpu().numpy()[0], state_info
+            )
+            
+            # 6. Loss计算（不反向传播）
+            loss_data = {}
+            if hasattr(self, 'last_state') and hasattr(self, 'last_action'):
+                actor_loss, critic_loss, additional_metrics = self._calculate_sac_losses(
+                    self.last_state, self.last_action, reward, current_state, terminated
+                )
+                
+                loss_data = {
+                    'actor_loss': actor_loss,
+                    'critic_loss': critic_loss,
+                    **additional_metrics
+                }
+                
+                if self.sac_debug_logging:
+                    self.sac_logger.log_loss_details(loss_data)
+            
+            # 7. 性能统计
+            computation_time = time.time() - start_time
+            memory_usage = self._get_memory_usage() if hasattr(self, '_get_memory_usage') else "N/A"
+            
+            # 8. 综合日志记录
+            if self.sac_debug_logging:
+                step_data = {
+                    **action_stats,
+                    **critic_stats,
+                    'reward_components': reward_components,
+                    'state_info': state_info,
+                    'computation_time': computation_time,
+                    'memory_usage': memory_usage
+                }
+                
+                self.sac_logger.log_step_details(step_data)
+                
+                # 记录统计数据
+                self.sac_logger.metrics_history['actions'].append(action.item())
+                self.sac_logger.metrics_history['rewards'].append(reward)
+                self.sac_logger.metrics_history['q1_values'].append(q1.item())
+                self.sac_logger.metrics_history['q2_values'].append(q2.item())
+                self.sac_logger.metrics_history['computation_time'].append(computation_time)
+                
+                # 定期统计摘要
+                self.sac_logger.log_statistics_summary()
+                
+                # 性能警告
+                if computation_time > 0.05:
+                    self.sac_logger.log_warning(f"SAC calculation took {computation_time:.4f}s (>50ms limit)")
+                
+                # 异常值检测
+                self._detect_anomalies(step_data, loss_data)
+            
+            # 保存当前状态用于下次计算
+            self.last_state = current_state
+            self.last_action = action.cpu().numpy().flatten()  # 确保是1D numpy数组
+            
+        except Exception as e:
+            if self.sac_debug_logging:
+                self.sac_logger.log_error(f"SAC calculation failed", e)
+                import traceback
+                self.get_logger().error(f"Full traceback: {traceback.format_exc()}")
+
+    def _extract_sac_state(self):
+        """提取SAC状态特征"""
+        try:
+            # 获取13维特征向量
+            features = self._compute_features_now()
+            if features is None:
+                return None
+            
+            # 使用状态管理器构建完整的状态序列
+            state_sequence = self.sac_components['state_manager'].extract_state_features(features)
+            return state_sequence
+            
+        except Exception as e:
+            if self.sac_debug_logging:
+                self.sac_logger.log_error(f"State extraction failed", e)
+            return None
+
+    def _extract_state_info(self):
+        """提取状态信息用于奖励计算"""
+        try:
+            features = self._compute_features_now()
+            if features is None:
+                return {}
+            
+            return {
+                'velocity': features[0],
+                'angular_velocity': features[1],
+                'distance_from_centerline': features[2],
+                'heading_error': features[3]
+            }
+            
+        except Exception as e:
+            if self.sac_debug_logging:
+                self.sac_logger.log_error(f"State info extraction failed", e)
+            return {}
+
+    def _calculate_sac_losses(self, state, action, reward, next_state, terminated):
+        """计算SAC损失函数（不反向传播）"""
+        with torch.no_grad():
+            # 转换为tensor
+            state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            # 确保action是正确的形状 - 修复维度问题
+            if isinstance(action, np.ndarray):
+                if action.ndim == 0:  # 标量
+                    action_t = torch.FloatTensor([action]).unsqueeze(0).to(self.device)
+                elif action.ndim == 1:  # 1D数组
+                    action_t = torch.FloatTensor(action).unsqueeze(0).to(self.device)
+                else:  # 已经是正确形状
+                    action_t = torch.FloatTensor(action).to(self.device)
+            else:  # 如果是tensor
+                action_t = action.view(1, -1)  # 确保是 (batch_size, action_dim)
+            
+            reward_t = torch.FloatTensor([reward]).to(self.device)
+            next_state_t = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
+            done_t = torch.FloatTensor([terminated]).to(self.device)
+            
+            # 调试信息
+            if self.sac_debug_logging:
+                self.get_logger().info(f"Debug shapes - state_t: {state_t.shape}, action_t: {action_t.shape}")
+            
+            # Critic损失
+            current_q1, current_q2 = self.sac_components['critic1'](state_t, action_t)
+            
+            # 目标Q值计算
+            next_mean, next_log_std = self.sac_components['actor'](next_state_t)
+            next_std = next_log_std.exp()
+            next_normal = torch.distributions.Normal(next_mean, next_std)
+            next_action_sample = next_normal.rsample()
+            next_action = torch.tanh(next_action_sample) * 5.0 + 5.0
+            
+            target_q1, target_q2 = self.sac_components['target_critic1'](next_state_t, next_action)
+            target_q = torch.min(target_q1, target_q2)
+            target = reward_t + (1 - done_t) * 0.99 * target_q  # gamma=0.99
+            
+            critic_loss = F.mse_loss(current_q1, target) + F.mse_loss(current_q2, target)
+            
+            # Actor损失
+            mean, log_std = self.sac_components['actor'](state_t)
+            std = log_std.exp()
+            normal = torch.distributions.Normal(mean, std)
+            action_sample = normal.rsample()
+            action_pred = torch.tanh(action_sample) * 5.0 + 5.0
+            
+            q1_pred, q2_pred = self.sac_components['critic1'](state_t, action_pred)
+            q_pred = torch.min(q1_pred, q2_pred)
+            
+            log_prob = normal.log_prob(action_sample).sum(-1, keepdim=True)
+            log_prob -= (2 * (np.log(2) - action_sample - F.softplus(-2 * action_sample))).sum(-1, keepdim=True)
+            
+            actor_loss = (0.2 * log_prob - q_pred).mean()  # alpha=0.2
+            
+            # TD误差和熵
+            td_error = torch.abs(current_q1 - target).mean()
+            entropy = -log_prob.mean()
+            
+            return actor_loss.item(), critic_loss.item(), {
+                'td_error': td_error.item(),
+                'entropy': entropy.item()
+            }
+
+    def _detect_anomalies(self, step_data, loss_data):
+        """检测异常值并记录警告"""
+        # Q值异常检测
+        q1, q2 = step_data['q1_value'], step_data['q2_value']
+        if abs(q1) > 1000 or abs(q2) > 1000:
+            self.sac_logger.log_warning(f"Q values are very large: Q1={q1:.2f}, Q2={q2:.2f}")
+        
+        # 动作异常检测
+        action = step_data['final_action']
+        if action < 0 or action > 10:
+            self.sac_logger.log_warning(f"Action out of bounds: {action:.4f}")
+        
+        # 损失异常检测
+        if loss_data:
+            if loss_data['actor_loss'] > 100:
+                self.sac_logger.log_warning(f"Actor loss very high: {loss_data['actor_loss']:.6f}")
+            if loss_data['critic_loss'] > 100:
+                self.sac_logger.log_warning(f"Critic loss very high: {loss_data['critic_loss']:.6f}")
+
+    def _get_memory_usage(self):
+        """获取内存使用情况"""
+        try:
+            if torch.cuda.is_available():
+                return f"{torch.cuda.memory_allocated()/1024**2:.1f}MB"
+            else:
+                return "CPU"
+        except:
+            return "N/A"
 
 
 def main(args=None):
