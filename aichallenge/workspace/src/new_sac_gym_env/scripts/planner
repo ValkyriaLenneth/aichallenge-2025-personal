@@ -404,13 +404,6 @@ class SACLogger:
         self.logger.warn(f"⚠️ SAC WARNING: {warning_msg}")
 
 # ======================================================================================
-# Model Definition (Copied from nn_planner_dev for reference, will be removed)
-# ======================================================================================
-
-# The SimplerVelocityLSTM class is now obsolete and will be replaced by the V2 architecture.
-# We keep it here temporarily for reference during the refactoring process.
-
-# ======================================================================================
 # Neural Network Planner Node with Time-Space Domain Mapping + SAC Components
 # ======================================================================================
 
@@ -419,11 +412,6 @@ class NNPlannerNode(Node):
         super().__init__('new_sac_gym_env_node')
         
         self.get_logger().info("🎯 Starting SAC Integration Phase...")
-        self.get_logger().info(f"📊 Adjusted Reward Weights:")
-        self.get_logger().info(f"   Progress Weight: 3.0 (强化速度奖励)")
-        self.get_logger().info(f"   Center Weight: 2.0 (平衡中线保持)")
-        self.get_logger().info(f"   Smoothness Weight: 0.1")
-        self.get_logger().info(f"   Efficiency Weight: 1.0 (新增)")
         
         # 时空域映射参数
         self.prediction_horizon_meters = self.declare_parameter('prediction_horizon_meters', 200.0).value
@@ -448,31 +436,15 @@ class NNPlannerNode(Node):
         self.debug_log_counter = 0
         self.debug_log_interval = 50  # 每50个周期输出一次汇总日志
         
-        self.get_logger().info(f"Prediction horizon: {self.prediction_horizon_meters}m")
-        if self.transition_zone_length > 0:
-            self.get_logger().info(f"Transition zone length: {self.transition_zone_length} points")
-        else:
-            self.get_logger().info("Transition zone: DISABLED")
-        self.get_logger().info(f"Time step: {self.time_step}s")
-        if self.enable_velocity_constraints:
-            self.get_logger().info(f"Max acceleration: {self.max_acceleration} m/s²")
-        else:
-            self.get_logger().info("Velocity continuity constraints: DISABLED")
-            
         self.get_logger().info(f"SAC calculation: {'ENABLED' if self.enable_sac_calculation else 'DISABLED'}")
         self.get_logger().info(f"SAC debug logging: {'ENABLED' if self.sac_debug_logging else 'DISABLED'}")
 
         # Load model - 使用正确的模型架构
         self.model_path = self.declare_parameter('model_path', '/aichallenge/nn_planner_dev/training_output/best_model.pth').value
-        self.get_logger().info(f"--- Loading LSTM model from: {self.model_path} ---")
+        self.get_logger().info(f"Loading LSTM model from: {self.model_path}")
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # 此部分将在后续步骤中被SAC网络初始化所取代
-        # self.model = SimplerVelocityLSTM(...)
-        # self.model.load_state_dict(...)
-        # self.model.to(self.device)
-        # self.model.eval()
-        self.get_logger().info("--- LSTM model loading deferred to SAC component initialization. ---")
+        self.get_logger().info("LSTM model loading deferred to SAC component initialization.")
 
         # SAC组件初始化
         if self.enable_sac_calculation:
@@ -502,10 +474,6 @@ class NNPlannerNode(Node):
         self.static_path_pts = None  # 存储静态路径点
         self.is_model_loaded = True  # Model is loaded in __init__
         
-        # 时空域映射缓存
-        self.velocity_mapping_cache = {}
-        self.last_mapping_update_time = None
-        self.last_position_index = None
         self.dt = self.time_step  # 添加时间步长变量
 
         # Create a timer that attempts to plan and publish
@@ -768,7 +736,8 @@ class NNPlannerNode(Node):
             # 车辆接近末尾，将速度控制应用到轨迹开始的前20个点
             apply_start_idx = 0
             apply_end_idx = apply_horizon
-            self.get_logger().info(f"Vehicle near end (idx {current_idx}), applying control to trajectory start [0:{apply_horizon}]")
+            if self.sac_debug_logging:
+                self.get_logger().info(f"Vehicle near end (idx {current_idx}), applying control to trajectory start [0:{apply_horizon}]")
         else:
             # 正常情况，应用到当前位置前方
             apply_start_idx = current_idx
@@ -778,7 +747,6 @@ class NNPlannerNode(Node):
         # 物理模拟器和底层控制器将负责平滑加速过程
 
         applied_count = 0
-        original_count = 0
         
         for i, original_point in enumerate(self.original_trajectory_msg.points):
             traj_point = type(original_point)()
@@ -793,7 +761,6 @@ class NNPlannerNode(Node):
                 applied_count += 1
             else:
                 traj_point.longitudinal_velocity_mps = original_point.longitudinal_velocity_mps
-                original_count += 1
             
             # 按照simple_trajectory_generator的格式设置其他字段为0
             traj_point.lateral_velocity_mps = 0.0
@@ -803,29 +770,9 @@ class NNPlannerNode(Node):
             
             output_trajectory.points.append(traj_point)
             
-        # 详细调试日志
+        # 简化的调试日志
         if self.sac_debug_logging:
-            velocities_in_applied_range = [p.longitudinal_velocity_mps for p in output_trajectory.points[apply_start_idx:apply_end_idx]]
-            
-            self.get_logger().info(f"TRAJECTORY DEBUG:")
-            self.get_logger().info(f"  Current vehicle index: {current_idx}")
-            self.get_logger().info(f"  Current vehicle velocity: {current_velocity:.3f} m/s")
-            self.get_logger().info(f"  Target velocity: {target_velocity:.3f} m/s")
-            self.get_logger().info(f"  Apply range: [{apply_start_idx}:{apply_end_idx}] (horizon: {apply_horizon})")
-            self.get_logger().info(f"  Applied velocities: {applied_count} points")
-            self.get_logger().info(f"  Original velocities: {original_count} points")
-            self.get_logger().info(f"  Total trajectory points: {total_points}")
-            self.get_logger().info(f"  Header frame_id: {output_trajectory.header.frame_id}")
-            
-            if velocities_in_applied_range:
-                self.get_logger().info(f"  Velocities in applied range: {[f'{v:.2f}' for v in velocities_in_applied_range[:5]]}...")  # 只显示前5个
-                self.get_logger().info(f"  First applied velocity: {velocities_in_applied_range[0]:.3f} m/s")
-                self.get_logger().info(f"  Last applied velocity: {velocities_in_applied_range[-1]:.3f} m/s")
-            
-            # 检查前几个点的详细信息
-            if len(output_trajectory.points) > 0:
-                first_point = output_trajectory.points[0]
-                self.get_logger().info(f"  First point velocity: {first_point.longitudinal_velocity_mps:.3f} m/s")
+            self.get_logger().info(f"Applied SAC velocity {target_velocity:.2f} m/s to {applied_count} trajectory points")
 
         return output_trajectory
 
@@ -892,222 +839,12 @@ class NNPlannerNode(Node):
         if self.sac_debug_logging:
             self.get_logger().info(f"SAC Update - Actor Loss: {actor_loss.item():.6f}, Critic Loss: {critic_loss.item():.6f}")
 
-    def time_to_space_mapping(self, predicted_velocities):
-        """
-        V1 函数，保留以防需要回退，但在V2中不使用。
-        """
-        current_position_idx = self._find_closest_path_idx(self.current_odometry, self.static_path_pts)
-        current_velocity = self.current_odometry.twist.twist.linear.x
-        
-        # 1. 计算累积行驶距离
-        cumulative_distances = [0.0]  # 起始距离为0
-        for i, velocity in enumerate(predicted_velocities):
-            distance_increment = velocity * self.dt  # 距离 = 速度 × 时间
-            cumulative_distances.append(cumulative_distances[-1] + distance_increment)
-        
-        # 2. 将累积距离映射到全局路径的空间点
-        velocity_mapping = {}
-        mapped_points_info = []  # 用于调试日志
-        
-        for i, total_distance in enumerate(cumulative_distances[1:]):  # 跳过起始点(距离=0)
-            # 在全局路径上找到距离当前位置total_distance的点
-            target_space_index = self._get_path_point_at_distance(
-                self.static_path_pts, current_position_idx, total_distance
-            )
-            
-            # 检查索引有效性
-            if target_space_index is not None and 0 <= target_space_index < len(self.static_path_pts):
-                velocity_mapping[target_space_index] = predicted_velocities[i]
-                mapped_points_info.append({
-                    'time_step': i,
-                    'distance': total_distance,
-                    'path_index': target_space_index,
-                    'velocity': predicted_velocities[i]
-                })
-
-        # 整合的调试日志输出
-        self.debug_log_counter += 1
-        if self.enable_debug_logs and (self.debug_log_counter % self.debug_log_interval == 1):
-            self.get_logger().info(f"=== 时空域映射总结 (周期 {self.debug_log_counter}) ===")
-            self.get_logger().info(f"车辆位置: 路径点{current_position_idx}, 当前速度: {current_velocity:.2f} m/s")
-            self.get_logger().info(f"LSTM时间步: 50个 (0.1s间隔, 共5.0s预测)")
-            
-            if mapped_points_info:
-                max_distance = cumulative_distances[-1]
-                coverage_start = min(velocity_mapping.keys())
-                coverage_end = max(velocity_mapping.keys())
-                mapped_velocities = list(velocity_mapping.values())
-                
-                self.get_logger().info(f"预测行驶距离: {max_distance:.1f}m")
-                self.get_logger().info(f"映射到路径点: {coverage_start}-{coverage_end} (共{len(velocity_mapping)}个稀疏点)")
-                self.get_logger().info(f"映射速度范围: [{min(mapped_velocities):.2f}, {max(mapped_velocities):.2f}] m/s")
-                self.get_logger().info(f"平均映射速度: {np.mean(mapped_velocities):.2f} m/s")
-                
-                # 详细映射信息（只显示前5个）
-                self.get_logger().info("前5个映射点详情:")
-                for info in mapped_points_info[:5]:
-                    self.get_logger().info(f"  时间步{info['time_step']}: {info['distance']:.1f}m → 路径点{info['path_index']}, 速度{info['velocity']:.2f}m/s")
-            else:
-                self.get_logger().warn("警告: 时空域映射未产生任何有效映射点")
-
-        return velocity_mapping
-
-    def ensure_velocity_continuity(self, current_velocity, predicted_velocities):
-        """
-        确保速度序列的物理可行性
-        """
-        corrected_velocities = []
-        last_velocity = current_velocity
-
-        continuity_violations = 0
-        
-        for i, predicted_v in enumerate(predicted_velocities):
-            max_delta_v = self.max_acceleration * self.dt
-            
-            if abs(predicted_v - last_velocity) > max_delta_v:
-                continuity_violations += 1
-                if predicted_v > last_velocity:
-                    corrected_v = last_velocity + max_delta_v
-                else:
-                    corrected_v = last_velocity - max_delta_v
-                
-                if self.enable_debug_logs and continuity_violations <= 3:  # 只记录前3个违规
-                    self.get_logger().info(f"Velocity continuity correction at step {i}: {predicted_v:.2f} -> {corrected_v:.2f} m/s")
-            else:
-                corrected_v = predicted_v
-                
-            corrected_velocities.append(corrected_v)
-            last_velocity = corrected_v
-
-        if self.enable_debug_logs:
-            self.get_logger().info(f"Velocity continuity check: {continuity_violations}/{len(predicted_velocities)} violations corrected")
-
-        return corrected_velocities
-
-    def create_hybrid_trajectory(self, velocity_mapping):
-        """
-        创建混合轨迹：保持完整CSV路径，用LSTM的时空域映射速度覆盖对应的稀疏路径点
-        
-        注意：velocity_mapping是稀疏的，只包含LSTM预测覆盖范围内的几个路径点
-        """
-        # 直接使用完整的原始轨迹作为基础
-        output_trajectory = Trajectory()
-        output_trajectory.header.stamp = self.get_clock().now().to_msg()
-        output_trajectory.header.frame_id = "map"
-
-        lstm_applied_count = 0
-        original_used_count = 0
-
-        # 发布完整的原始轨迹（所有点）
-        for i, original_point in enumerate(self.original_trajectory_msg.points):
-            # 复制原始轨迹点
-            traj_point = type(original_point)()
-            traj_point.pose = original_point.pose
-            traj_point.longitudinal_velocity_mps = original_point.longitudinal_velocity_mps
-            traj_point.lateral_velocity_mps = original_point.lateral_velocity_mps
-            traj_point.acceleration_mps2 = original_point.acceleration_mps2
-            traj_point.heading_rate_rps = original_point.heading_rate_rps
-            traj_point.front_wheel_angle_rad = original_point.front_wheel_angle_rad
-            traj_point.rear_wheel_angle_rad = original_point.rear_wheel_angle_rad
-
-            # 应用LSTM时空域映射的速度（稀疏覆盖）
-            if i in velocity_mapping:
-                traj_point.longitudinal_velocity_mps = float(velocity_mapping[i])
-                lstm_applied_count += 1
-            else:
-                # 使用原始CSV速度
-                original_used_count += 1
-
-            output_trajectory.points.append(traj_point)
-
-        total_points = len(output_trajectory.points)
-        
-        # 整合的调试日志输出
-        if self.enable_debug_logs and (self.debug_log_counter % self.debug_log_interval == 1):
-            self.get_logger().info(f"=== 混合轨迹总结 ===")
-            self.get_logger().info(f"轨迹总点数: {total_points}")
-            self.get_logger().info(f"LSTM控制: {lstm_applied_count}个点 ({lstm_applied_count/total_points*100:.1f}%) [时空域映射]")
-            self.get_logger().info(f"CSV原始: {original_used_count}个点 ({original_used_count/total_points*100:.1f}%) [远程路径点]")
-
-        return output_trajectory
-
-    def publish_fallback_trajectory(self):
-        """
-        发布后备轨迹（完整的原始CSV轨迹）
-        """
-        if self.original_trajectory_msg is not None:
-            fallback_trajectory = Trajectory()
-            fallback_trajectory.header.stamp = self.get_clock().now().to_msg()
-            fallback_trajectory.header.frame_id = "map"
-            
-            # 发布完整的原始轨迹
-            for original_point in self.original_trajectory_msg.points:
-                fallback_trajectory.points.append(original_point)
-            
-            self.trajectory_pub.publish(fallback_trajectory)
-            
-            if self.enable_debug_logs:
-                self.get_logger().warn(f"Published complete fallback trajectory with {len(fallback_trajectory.points)} points")
-
-    def run_model_inference_fallback(self):
-        """
-        运行旧模型推理作为临时后备方案 - 在V2中不再需要
-        """
-        # 1. Compute the feature vector for the current state
-        features = self._compute_features_now()
-        if features is None:
-            return None
-
-        # 2. Create a dummy sequence for the model input
-        # The model was trained on sequences, but for real-time inference,
-        # we use the most current feature vector and replicate it.
-        input_seq_len = 149 # Based on the training script (3s at ~50Hz)
-        input_data = np.tile(features, (input_seq_len, 1))
-        
-        # 3. Convert to tensor and add batch dimension
-        input_tensor = torch.from_numpy(input_data).float().unsqueeze(0).to(self.device)
-
-        # 4. Run inference using a temporary old model instance
-        if not hasattr(self, 'fallback_model'):
-            self.fallback_model = SimplerVelocityLSTM().to(self.device)
-            try:
-                model_path = self.declare_parameter('model_path').value # Re-get path
-                self.fallback_model.load_state_dict(torch.load(model_path, map_location=self.device))
-                self.fallback_model.eval()
-                self.get_logger().info("--- Temporary fallback model loaded. ---")
-            except Exception as e:
-                self.get_logger().error(f"Could not load fallback model: {e}")
-                return None
-
-        inference_start_time = time.time()
-        try:
-            with torch.no_grad():
-                predictions_tensor = self.fallback_model(input_tensor)
-        except Exception as e:
-            self.get_logger().error(f"Fallback LSTM model inference failed: {e}")
-            return None
-            
-        inference_time = time.time() - inference_start_time
-        
-        # 5. Convert back to numpy array and flatten
-        predicted_velocities = predictions_tensor.squeeze().cpu().numpy()
-        
-        # 整合的推理日志输出
-        if self.enable_debug_logs and (self.debug_log_counter % self.debug_log_interval == 0):
-            self.get_logger().info(f"=== FALLBACK LSTM INFERENCE SUMMARY ===")
-            self.get_logger().info(f"Current velocity: {features[0]:.2f} m/s, Angular velocity: {features[1]:.3f} rad/s")
-            self.get_logger().info(f"Distance from centerline: {features[2]:.3f} m, Heading error: {features[3]:.3f} rad")
-            self.get_logger().info(f"Inference time: {inference_time*1000:.2f}ms")
-            self.get_logger().info(f"Predicted velocity range: [{predicted_velocities.min():.2f}, {predicted_velocities.max():.2f}] m/s")
-            self.get_logger().info(f"Mean predicted velocity: {predicted_velocities.mean():.2f} m/s")
-            
-        return predicted_velocities
-
     # ======================================================================================
     # Feature Engineering (Copied from nn_planner_dev/post_process.py)
     # ======================================================================================
     
     def _compute_features_now(self):
+        """计算当前状态的13维特征向量"""
         state_pose = self.current_odometry.pose.pose
         state_twist = self.current_odometry.twist.twist
         
@@ -1116,7 +853,7 @@ class NNPlannerNode(Node):
         current_angular_velocity_z = state_twist.angular.z
         
         # Path-relative features
-        closest_idx = self._find_closest_path_idx(self.current_odometry, self.static_path_pts)
+        closest_idx = self._find_closest_path_idx(self.current_odometry, self.static_path_pts, self.last_closest_idx)
         closest_pt = self.static_path_pts[closest_idx]
         
         distance = np.linalg.norm(np.array([state_pose.position.x, state_pose.position.y]) - closest_pt)
@@ -1142,11 +879,6 @@ class NNPlannerNode(Node):
             curvature_features.append(curvature)
             
         return np.concatenate([[current_velocity_x, current_angular_velocity_z, distance_from_centerline, heading_error], curvature_features])
-
-    def _find_closest_path_idx_global(self, state, path_pts):
-        """ V4: 保留旧的全局搜索逻辑作为参考，不再使用 """
-        pos = state.pose.pose.position
-        return np.argmin(np.linalg.norm(path_pts - np.array([pos.x, pos.y]), axis=1))
 
     def _get_path_point_at_distance(self, path_pts, start_idx, distance):
         if distance == 0: return start_idx
@@ -1197,10 +929,6 @@ class NNPlannerNode(Node):
                 self.get_logger().info(f"Static path loaded with {len(self.static_path_pts)} points")
                 self._path_loaded = True
 
-    def _run_sac_calculation(self):
-        """运行SAC计算流程（此函数在V2中被整合进主循环，不再单独调用）"""
-        pass
-
     def _extract_sac_state(self):
         """提取SAC状态特征 (V2)"""
         try:
@@ -1219,26 +947,18 @@ class NNPlannerNode(Node):
             return None
 
     def _extract_state_info(self):
-        """提取状态信息用于奖励计算"""
+        """提取状态信息用于奖励计算，复用_compute_features_now的计算结果"""
         try:
             features = self._compute_features_now()
             if features is None:
                 return {}
             
-            # 提取曲率信息，用于奖励计算
-            # 我们取最接近的点的曲率作为当前曲率
-            # V4 方案: 使用前进式搜索
-            closest_idx = self._find_closest_path_idx(self.current_odometry, self.static_path_pts, self.last_closest_idx)
-            # 注意: 这里不更新 last_closest_idx，因为它只应在主循环中更新
+            # 提取当前位置的曲率（来自特征向量的中心点曲率）
+            curvature = features[8]  # sample_distances中索引4对应距离0，即当前位置
             
-            p2 = self.static_path_pts[closest_idx]
-            p1 = self.static_path_pts[max(0, closest_idx - 5)]
-            p3 = self.static_path_pts[min(len(self.static_path_pts) - 1, closest_idx + 5)]
-            curvature = self._calculate_curvature(p1, p2, p3) if not (np.array_equal(p1,p2) or np.array_equal(p2,p3)) else 0.0
-
             return {
                 'velocity': features[0],
-                'angular_velocity': features[1],
+                'angular_velocity': features[1], 
                 'distance_from_centerline': features[2],
                 'heading_error': features[3],
                 'curvature': curvature,
@@ -1248,10 +968,6 @@ class NNPlannerNode(Node):
             if self.sac_debug_logging:
                 self.sac_logger.log_error(f"State info extraction failed", e)
             return {}
-
-    def _calculate_sac_losses(self, state, action, reward, next_state, terminated):
-        """此函数在V2中被整合进sac_update，不再单独使用"""
-        pass
 
     def _detect_anomalies(self, step_data, loss_data):
         """检测异常值并记录警告"""
