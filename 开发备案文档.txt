@@ -24,27 +24,6 @@
 aichallenge/nn_planner_dev/task.md
 aichallenge/nn_planner_dev/dev_note.md
 
-@开发备案文档.txt 
-按照开发文档，我们现在已经完成阶段1和2的任务。
-但是我需要在这个阶段就解决的一个问题是：
-下游的控制器：@simple_pure_pursuit 实际上接受的是一个全局路径点。
-而我们当前的@new_sac_gym_env 模型推理的是一个局部的路径点。
-
-我详细点来说明：
-在大会官方的原始方案中，simple trajectory generator会定期发布整个地图的路径，也就是csv中定义的。
-而我们的LSTM训练逻辑，则是从ros2 bag record命令中读取到的实际数据来进行训练的。也就是说，lstm输出的是未来50个autoware topic时钟值，而不是simple trajectory generator发布的路径
-
-当前系统架构的数据流：
-官方方案：simple_trajectory_generator 每1秒发布整个CSV路径（~1000+个点）到 /planning/scenario_planning/original_trajectory
-您的LSTM方案：new_sac_gym_env 接收这个全局路径，但LSTM模型预测的是未来50个时间步长的速度值（基于ROS2 bag数据训练）
-下游控制器：simple_pure_pursuit 需要接收一个完整的轨迹路径（包含坐标和速度）
-核心矛盾：
-空间域 vs 时间域：CSV路径是空间采样的（按距离间隔），而LSTM输出是时间采样的（按时间间隔）
-全局 vs 局部：Pure pursuit需要全局路径进行look-ahead，但LSTM只输出局部的未来50个时间步
-
-好的，让我从原理层面详细解释方案1的核心思想和实现机制。
-
-## 方案1核心原理详解
 
 ### 1. 时空域映射的数学基础
 
@@ -63,271 +42,6 @@ aichallenge/nn_planner_dev/dev_note.md
 ```
 空间距离 = ∫ v(t) dt ≈ Σ v_i × dt
 ```
-
-### 1.2 映射算法详解
-
-```python
-def time_to_space_mapping(predicted_velocities, current_position, dt=0.1):
-    """
-    将时间域的速度预测转换为空间域的路径点
-    
-    输入：
-    - predicted_velocities: [v₀, v₁, ..., v₄₉] 长度50的速度数组
-    - current_position: 当前车辆位置在全局路径中的索引
-    - dt: 时间步长
-    
-    输出：
-    - space_velocity_map: {路径点索引: 预测速度} 的映射关系
-    """
-    
-    # 1. 计算累积行驶距离
-    cumulative_distances = [0]
-    for i, velocity in enumerate(predicted_velocities):
-        distance_increment = velocity * dt
-        cumulative_distances.append(cumulative_distances[-1] + distance_increment)
-    
-    # 2. 将累积距离映射到全局路径的空间点
-    space_velocity_map = {}
-    for i, total_distance in enumerate(cumulative_distances[1:]):  # 跳过起始点
-        # 在全局路径上找到距离当前位置total_distance的点
-        target_space_index = find_path_point_at_distance(
-            global_path, current_position, total_distance
-        )
-        if target_space_index is not None:
-            space_velocity_map[target_space_index] = predicted_velocities[i]
-    
-    return space_velocity_map
-```
-
-### 2. 智能拼接策略
-
-#### 2.1 分区域处理原理
-
-将全局路径分为三个区域：
-
-```
-|----已过区域----|----LSTM覆盖区域----|----原始CSV区域----|
-     (保持)           (LSTM预测)         (CSV参考速度)
-```
-
-**区域定义**：
-- **已过区域**：车辆后方的路径点，保持原始状态
-- **LSTM覆盖区域**：车辆前方200米范围，使用LSTM预测速度
-- **原始CSV区域**：更远距离的路径点，保持CSV原始速度
-
-#### 2.2 平滑过渡算法
-
-为避免速度突变，在区域边界处进行平滑过渡：
-
-```python
-def smooth_velocity_transition(lstm_velocities, csv_velocities, transition_length=20):
-    """
-    在LSTM预测区域和CSV原始区域之间进行平滑过渡
-    
-    参数：
-    - lstm_velocities: LSTM预测的速度序列
-    - csv_velocities: CSV原始速度序列  
-    - transition_length: 过渡区域长度（路径点数）
-    """
-    
-    # 使用加权平均进行平滑过渡
-    smoothed_velocities = []
-    
-    for i in range(transition_length):
-        # 计算权重：从LSTM权重1逐渐过渡到CSV权重1
-        lstm_weight = (transition_length - i) / transition_length
-        csv_weight = i / transition_length
-        
-        # 加权混合
-        mixed_velocity = lstm_weight * lstm_velocities[i] + csv_weight * csv_velocities[i]
-        smoothed_velocities.append(mixed_velocity)
-    
-    return smoothed_velocities
-```
-
-### 3. 实时更新机制
-
-#### 3.1 滑动窗口原理
-
-```
-时刻 t:   |--LSTM预测窗口(50步)--|
-时刻 t+1:    |--LSTM预测窗口(50步)--|
-时刻 t+2:       |--LSTM预测窗口(50步)--|
-```
-
-每个控制周期（0.1秒），预测窗口向前滑动，需要重新计算时空映射。
-
-#### 3.2 增量更新算法
-
-```python
-class AdaptiveVelocityPlanner:
-    def __init__(self):
-        self.velocity_cache = {}  # 缓存已计算的速度映射
-        self.last_update_position = None
-        
-    def update_velocity_mapping(self, current_position, lstm_predictions):
-        """
-        增量更新速度映射，避免重复计算
-        """
-        
-        # 检查是否需要更新
-        if self.should_update(current_position):
-            # 清理过期的缓存数据
-            self.cleanup_expired_cache(current_position)
-            
-            # 计算新的映射关系
-            new_mapping = self.compute_new_mapping(current_position, lstm_predictions)
-            
-            # 更新缓存
-            self.velocity_cache.update(new_mapping)
-            self.last_update_position = current_position
-            
-        return self.get_current_trajectory()
-```
-
-### 4. 处理边界情况
-
-#### 4.1 速度不连续问题
-
-**问题**：LSTM预测的第一个速度值可能与当前实际速度差异较大
-
-**解决方案**：
-```python
-def ensure_velocity_continuity(current_velocity, predicted_velocities, max_accel=2.0, dt=0.1):
-    """
-    确保速度序列的物理可行性
-    """
-    corrected_velocities = [current_velocity]  # 起始速度为当前实际速度
-    
-    for i, predicted_v in enumerate(predicted_velocities):
-        last_v = corrected_velocities[-1]
-        
-        # 计算允许的最大速度变化
-        max_delta_v = max_accel * dt
-        
-        # 限制速度变化率
-        if abs(predicted_v - last_v) > max_delta_v:
-            if predicted_v > last_v:
-                corrected_v = last_v + max_delta_v
-            else:
-                corrected_v = last_v - max_delta_v
-        else:
-            corrected_v = predicted_v
-            
-        corrected_velocities.append(corrected_v)
-    
-    return corrected_velocities[1:]  # 返回除当前速度外的预测序列
-```
-
-#### 4.2 路径终点处理
-
-**问题**：当车辆接近路径终点时，LSTM预测可能超出路径范围
-
-**解决方案**：
-```python
-def handle_path_boundary(global_path, current_position, predicted_mapping):
-    """
-    处理路径边界情况
-    """
-    max_path_index = len(global_path) - 1
-    
-    # 过滤超出路径范围的映射
-    valid_mapping = {
-        idx: velocity for idx, velocity in predicted_mapping.items()
-        if idx <= max_path_index
-    }
-    
-    # 如果预测窗口超出路径，在终点附近进行减速处理
-    if max(predicted_mapping.keys()) > max_path_index:
-        # 计算到终点的距离
-        distance_to_end = calculate_distance_to_path_end(current_position, global_path)
-        
-        # 应用减速策略
-        if distance_to_end < 50:  # 距离终点50米内开始减速
-            apply_deceleration_strategy(valid_mapping, distance_to_end)
-    
-    return valid_mapping
-```
-
-### 5. 系统性能优化
-
-#### 5.1 计算复杂度分析
-
-- **时间复杂度**：O(n + m)，其中n为LSTM预测步数（50），m为影响范围内的路径点数（~200）
-- **空间复杂度**：O(m)，主要存储速度映射关系
-
-#### 5.2 实时性保证
-
-```python
-class RealTimePlanner:
-    def __init__(self):
-        self.computation_budget = 0.05  # 50ms计算预算
-        self.fallback_strategy = "use_csv_velocity"
-        
-    def plan_with_timeout(self, lstm_predictions):
-        """
-        带超时保护的规划算法
-        """
-        start_time = time.time()
-        
-        try:
-            # 执行主要的时空映射算法
-            result = self.main_planning_algorithm(lstm_predictions)
-            
-            # 检查计算时间
-            if time.time() - start_time > self.computation_budget:
-                self.get_logger().warn("Planning computation exceeded budget, consider optimization")
-            
-            return result
-            
-        except Exception as e:
-            # 降级到备用策略
-            self.get_logger().error(f"Planning failed: {e}, using fallback strategy")
-            return self.execute_fallback_strategy()
-```
-
-### 6. 与SAC训练的兼容性
-
-这个方案为后续的SAC训练提供了良好的基础：
-
-1. **状态空间设计**：当前位置、速度、路径曲率等特征易于提取
-2. **动作空间定义**：可以直接使用速度调整量作为动作
-3. **奖励函数计算**：基于路径跟踪误差、速度平滑性等指标
-
-通过这种时空域映射的方法，我们既保持了系统的实时性，又充分利用了LSTM的预测能力，为整个自动驾驶系统提供了一个稳定、高效的速度规划解决方案。
-
-
-这是一个很好的问题！让我解释一下为什么会出现这种重复代码的情况，以及ROS2包的两种不同部署方式：
-ROS2包的两种可执行文件部署方式
-方式1：Entry Points（推荐的现代方式）
-Apply to planner
-工作原理：Python包管理器会自动生成一个可执行脚本，该脚本调用模块中的函数
-文件位置：install/lib/new_sac_gym_env/planner（自动生成）
-源代码：new_sac_gym_env/planner_node.py
-方式2：Scripts目录（传统方式）
-Apply to planner
-工作原理：直接复制脚本文件到安装目录
-文件位置：scripts/planner（手动维护）
-源代码：scripts/planner本身就是完整的可执行代码
-为什么会出现重复？
-这个包设计存在几个问题：
-历史遗留：可能最初使用的是scripts方式，后来想改为entry points方式，但没有删除旧文件
-开发者不确定：可能开发者不确定哪种方式会被实际使用，所以保留了两种
-构建系统混乱：setup.py中的CustomInstallCommand试图将两种方式结合，这很容易出错
-实际运行的是哪个文件？
-从我检查setup.py可以看出，实际的安装逻辑是：
-这个CustomInstallCommand试图将entry point生成的可执行文件复制到lib/package_name/目录。但实际上：
-Entry point会自动生成：install/lib/new_sac_gym_env/planner（调用planner_node.py）
-Scripts会被复制：scripts/planner可能也会被安装
-现在让我检查一下实际安装后的文件：
-找到问题了！
-安装的可执行文件是一个符号链接，直接指向scripts/planner，而不是我们修改的planner_node.py！
-Apply to planner
-这说明：
-实际运行的是：scripts/planner文件
-我们修改的：new_sac_gym_env/planner_node.py（没有被使用）
-解决方案
-我们需要将时空域映射的代码更新到scripts/planner文件中。让我现在就做这个更新：
 
 总结答案
 关于为什么会有两个文件的问题：
@@ -350,56 +64,497 @@ CustomInstallCommand试图将两种方式结合，但结果是符号链接指向
 后备轨迹机制
 现在重新编译运行，应该能看到我们期待的时空域映射调试信息了。
 
-=================== 当前进度总结 ===================
-✅ 阶段1-2: LSTM模型加载和时空域映射 - 已完成
-✅ 阶段3: SAC组件集成验证 - 已完成
-   - Actor网络: 366,082参数
-   - Critic网络: 732,162参数  
-   - 奖励权重调整: Progress=3.0, Center=2.0
-   - 详细日志系统: 每10步Actor/Critic/Reward详情
-   - 性能验证: 进度奖励0→15.55, 总奖励-5.49→+12.46
 
-=================== 下一步开发计划 ===================
+# SAC强化学习系统开发规范文档
 
-## 🎯 阶段4: SAC正式训练模式启用
+## 1. 项目背景与目标
 
-### 📋 主要任务：
-1. **替换推理模式为训练模式**
-   - 将SAC网络参数从eval()模式切换到train()模式
-   - 启用gradient计算和反向传播
-   - 配置optimizer (Adam) 和学习率
+### 1.1 项目目标
+在Autoware自动驾驶系统中，基于预训练LSTM模型开发SAC强化学习系统，在固定路径上学习最优速度策略，实现更高的圈速表现。
 
-2. **实现完整的SAC训练循环**
-   - Experience replay buffer实现
-   - Target网络软更新机制 (τ=0.005)
-   - 损失函数反向传播和参数更新
-   - 温度参数α的自动调整
+### 1.2 技术路线
+- **基础模型**：使用已训练的LSTM作为特征提取器
+- **强化学习算法**：SAC (Soft Actor-Critic)
+- **学习目标**：固定路径，优化速度控制
+- **集成方式**：LSTM特征提取 + SAC决策优化
 
-3. **训练记录和可视化系统**
-   - TensorBoard日志集成
-   - 训练指标实时记录 (loss, reward, Q-values)
-   - 模型checkpoint自动保存
-   - 训练进度可视化仪表板
+## 2. SAC-LSTM集成架构设计
 
-4. **优化调试日志可读性**
-   - 分级日志系统 (INFO/DEBUG/WARN)
-   - 训练关键指标突出显示
-   - 性能瓶颈自动检测和报警
-   - 日志压缩和轮转机制
+### 2.1 整体架构
 
-### 🔧 技术要点：
-- **内存管理**: 实现经验回放缓冲区，大小10K-50K transitions
-- **训练稳定性**: 梯度裁剪、学习率调度
-- **实时性保证**: 训练计算预算控制(<100ms)
-- **模型保存**: 每1000步自动保存最佳模型
+```
+输入: 历史5秒13维特征序列 [sequence_length, 13]
+     ↓
+LSTM特征提取器 (参与端到端训练)
+     ↓
+压缩特征向量 [hidden_dim] (如256维)
+     ↓
+SAC决策网络 (Actor + Twin Critics)
+     ↓
+输出: 1维目标速度 [0, 15] m/s
+```
 
-### 📊 验证目标：
-- 观察到loss曲线下降趋势
-- 平均奖励逐步提升
-- 车辆行为改善（速度控制更平滑）
-- 训练过程稳定无崩溃
+### 2.2 核心组件
 
-### ⏰ 预计完成时间：
-2-3小时（考虑调试和优化时间）
+#### 2.2.1 特征提取器 (LSTM)
+- **输入维度**：[batch_size, sequence_length, 13]
+- **输出维度**：[batch_size, hidden_dim]
+- **训练策略**：参与SAC端到端训练（不冻结参数）
+- **初始化**：使用预训练LSTM权重
 
-========================================================
+#### 2.2.2 Actor网络
+- **输入**：LSTM输出的hidden_dim维特征向量
+- **输出**：目标速度的概率分布参数 (mean, log_std)
+- **初始化**：使用预训练LSTM的FC层权重
+- **动作空间**：1维连续 [0, 15] m/s
+
+#### 2.2.3 Twin Critic网络
+- **输入**：特征向量 + 动作 → [hidden_dim + 1]
+- **输出**：Q值标量
+- **数量**：两个独立Critic + 两个Target Critic
+- **初始化**：随机初始化
+
+## 3. 强化学习环境定义
+
+### 3.1 状态空间 (State Space)
+- **原始输入**：历史5秒的13维特征序列
+  - 当前速度、角速度 (2维)
+  - 距离中心线距离、朝向偏差角 (2维)
+  - -25~+25米路纹特征 (9维)
+- **实际观测**：LSTM处理后的hidden_dim维特征向量
+
+### 3.2 动作空间 (Action Space)
+- **维度**：1维连续控制
+- **范围**：[0, 15] m/s (目标速度)
+- **约束**：符合Autoware系统规范
+- **物理限制**：考虑加速度限制确保可达性
+
+### 3.3 回合定义 (Episode)
+- **开始条件**：赛道起点，初始速度0
+- **结束条件**：
+  - 完成一圈赛道（正常结束）
+  - 触发终止条件（异常结束）
+- **最大步数**：根据赛道长度和预期速度确定
+
+## 4. 奖励函数设计
+
+### 4.1 奖励函数公式
+
+```
+R_total = R_speed + R_track + R_smoothness + R_penalty
+```
+
+### 4.2 各组件定义
+
+#### 4.2.1 速度奖励 (R_speed)
+**直道奖励**：
+```
+if |curvature| < 0.01:  # 直道判断
+    R_speed = 10.0 × (current_velocity / 15.0)
+```
+
+**弯道奖励**：
+```
+if |curvature| ≥ 0.01:  # 弯道判断
+    optimal_speed = sqrt(lateral_acceleration_limit / |curvature|)
+    optimal_speed = min(optimal_speed, 12.0)  # 弯道限速
+    speed_error = |current_velocity - optimal_speed| / optimal_speed
+    R_speed = 8.0 × (1.0 - speed_error)
+```
+
+#### 4.2.2 轨道保持奖励 (R_track)
+```
+R_track = -5.0 × (distance_from_centerline)²
+```
+
+#### 4.2.3 平滑性奖励 (R_smoothness)
+```
+speed_change = |current_action - last_action|
+R_smoothness = -2.0 × speed_change
+```
+
+#### 4.2.4 终止条件与惩罚 (R_penalty)
+**轨道偏离**：
+```
+if |distance_from_centerline| > 3.0:
+    terminated = True
+    R_penalty = -100.0
+```
+
+**速度异常（撞墙检测）**：
+```
+if target_speed > 1.0 and actual_velocity < 1.0 and step_count > 50:
+    stall_counter += 1
+    if stall_counter > 10:  # 连续10步低速
+        terminated = True
+        R_penalty = -100.0
+```
+
+### 4.3 时序关系说明
+
+**正确的奖励计算时序**：
+```python
+# 标准RL转移：state_t → action_t → reward_t → state_t+1
+
+def step(self, action_t):
+    prev_state = self.current_state.copy()      # 保存state_t
+    
+    self.execute_action(action_t)               # 执行action_t
+    
+    current_state = self.get_current_state()    # 获得state_t+1
+    
+    # 基于执行action_t的结果计算reward_t
+    reward_t = self.calculate_reward(prev_state, action_t, current_state)
+    
+    return current_state, reward_t, done
+```
+
+## 5. SAC训练流程规范
+
+### 5.1 训练流程概览
+
+```
+Phase 1: 初始化 → Phase 2: 在线学习循环 → Phase 3: 监控调优
+```
+
+### 5.2 详细训练流程
+
+#### 5.2.1 初始化阶段
+```python
+# 1. 网络初始化
+lstm_extractor = load_pretrained_lstm()           # 加载预训练LSTM
+actor = initialize_actor_with_lstm_fc(lstm_extractor)  # 用LSTM FC层初始化
+critic1, critic2 = initialize_twin_critics()     # 随机初始化双Critic
+target_critic1, target_critic2 = copy_critics()  # 复制到Target网络
+
+# 2. 组件初始化
+replay_buffer = ReplayBuffer(capacity=100000)    # 经验回放池
+optimizers = setup_optimizers(lr=3e-4)           # 优化器设置
+hyperparams = setup_sac_hyperparams()            # SAC超参数
+```
+
+#### 5.2.2 在线学习循环
+```python
+for episode in range(max_episodes):
+    state = env.reset()  # 重置到赛道起点
+    episode_reward = 0
+    
+    for step in range(max_steps_per_episode):
+        # === 环境交互 ===
+        action = actor.select_action(state, exploration=True)  # 策略采样
+        next_state, reward, done, info = env.step(action)      # 环境反馈
+        
+        # === 经验存储 ===
+        replay_buffer.store(state, action, reward, next_state, done)
+        
+        # === 批量学习更新 ===
+        if len(replay_buffer) > min_buffer_size:
+            sac_update(replay_buffer, batch_size=256)  # 批量更新
+        
+        # === 状态转移 ===
+        state = next_state
+        episode_reward += reward
+        
+        if done:
+            break
+    
+    # 记录episode统计
+    log_episode_metrics(episode, episode_reward, lap_time)
+```
+
+#### 5.2.3 SAC更新算法
+```python
+def sac_update(replay_buffer, batch_size):
+    # === 批量采样 ===
+    batch = replay_buffer.sample(batch_size)
+    states, actions, rewards, next_states, dones = batch
+    
+    # === Critic更新 ===
+    with torch.no_grad():
+        # 1. Target动作采样
+        next_actions, next_log_probs = actor.sample(next_states)
+        
+        # 2. Target Q值计算（悲观估计）
+        target_q1, target_q2 = target_critic(next_states, next_actions)
+        target_q = torch.min(target_q1, target_q2) - alpha * next_log_probs
+        
+        # 3. TD目标计算（贝尔曼方程）
+        q_target = rewards + gamma * (1 - dones) * target_q
+    
+    # 4. 当前Q值
+    current_q1, current_q2 = critic(states, actions)
+    
+    # 5. Critic损失与更新
+    critic_loss = F.mse_loss(current_q1, q_target) + F.mse_loss(current_q2, q_target)
+    update_critic(critic_loss)
+    
+    # === Actor更新 ===
+    # 6. 重参数化采样
+    new_actions, log_probs = actor.sample(states)
+    
+    # 7. Q值评估
+    q1_new, q2_new = critic(states, new_actions)
+    q_new = torch.min(q1_new, q2_new)
+    
+    # 8. Actor损失（最大化Q值 + 熵正则化）
+    actor_loss = (alpha * log_probs - q_new).mean()
+    update_actor(actor_loss)
+    
+    # === Target网络软更新 ===
+    soft_update(target_critic, critic, tau=0.005)
+    
+    # === 温度系数更新（可选）===
+    update_temperature_coefficient(log_probs, target_entropy)
+```
+
+## 6. 技术实现要点
+
+### 6.1 网络架构细节
+
+#### 6.1.1 LSTM特征提取器
+```python
+class LSTMFeatureExtractor(nn.Module):
+    def __init__(self, input_size=13, hidden_size=256, num_layers=2):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, 
+                           batch_first=True, dropout=0.2)
+    
+    def forward(self, x):  # x: [batch, seq_len, 13]
+        lstm_out, (h_n, c_n) = self.lstm(x)
+        return h_n[-1]  # 返回最后一层的隐状态 [batch, hidden_size]
+```
+
+#### 6.1.2 SAC Actor网络
+```python
+class SACActorNetwork(nn.Module):
+    def __init__(self, feature_dim=256, action_dim=1, hidden_dim=256):
+        super().__init__()
+        self.feature_extractor = LSTMFeatureExtractor()  # LSTM特征提取
+        self.policy_net = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU()
+        )
+        self.mean_head = nn.Linear(hidden_dim, action_dim)
+        self.log_std_head = nn.Linear(hidden_dim, action_dim)
+    
+    def forward(self, sequence_input):  # sequence_input: [batch, seq_len, 13]
+        features = self.feature_extractor(sequence_input)
+        policy_features = self.policy_net(features)
+        mean = self.mean_head(policy_features)
+        log_std = torch.clamp(self.log_std_head(policy_features), -20, 2)
+        return mean, log_std
+```
+
+### 6.2 关键超参数
+
+```python
+# SAC核心超参数
+GAMMA = 0.99                    # 折扣因子
+TAU = 0.005                     # 软更新系数
+ALPHA = 0.2                     # 熵正则化系数
+TARGET_ENTROPY = -1.0           # 目标熵（-action_dim）
+
+# 训练超参数
+LEARNING_RATE = 3e-4            # 学习率
+BATCH_SIZE = 256                # 批量大小
+REPLAY_BUFFER_SIZE = 100000     # 经验池容量
+MIN_BUFFER_SIZE = 10000         # 开始训练的最小经验数
+
+# 奖励权重
+W_SPEED_STRAIGHT = 10.0         # 直道速度权重
+W_SPEED_CORNER = 8.0            # 弯道速度权重
+W_TRACK_KEEPING = -5.0          # 轨道保持权重
+W_SMOOTHNESS = -2.0             # 平滑性权重
+W_TERMINATION_PENALTY = -100.0  # 终止惩罚
+```
+
+### 6.3 数据流与接口规范
+
+#### 6.3.1 输入数据格式
+```python
+# 历史特征序列
+sequence_input = {
+    'shape': [batch_size, sequence_length, feature_dim],
+    'dtype': torch.float32,
+    'range': normalized,
+    'content': [velocity, angular_velocity, lateral_error, heading_error, path_features]
+}
+```
+
+#### 6.3.2 输出动作格式
+```python
+# SAC输出动作
+action_output = {
+    'shape': [batch_size, 1],
+    'dtype': torch.float32,
+    'range': [0.0, 15.0],  # m/s
+    'content': target_velocity
+}
+```
+
+## 7. 验证与测试标准
+
+### 7.1 组件级验证
+
+#### 7.1.1 LSTM特征提取验证
+- [ ] 输入输出维度正确性
+- [ ] 预训练权重加载成功
+- [ ] 特征表示合理性检查
+
+#### 7.1.2 SAC网络验证
+- [ ] Actor网络前向传播正常
+- [ ] Critic网络Q值估计合理
+- [ ] 损失函数计算正确
+
+#### 7.1.3 奖励函数验证
+- [ ] 直道高速奖励正确
+- [ ] 弯道合理速度奖励正确
+- [ ] 终止条件触发准确
+
+### 7.2 系统级验证
+
+#### 7.2.1 训练稳定性
+- [ ] 损失函数收敛
+- [ ] Q值估计稳定
+- [ ] 策略改进明显
+
+#### 7.2.2 性能指标
+- [ ] 圈速时间改进
+- [ ] 轨道偏离减少
+- [ ] 动作平滑性提升
+
+### 7.3 成功标准
+
+#### 7.3.1 短期目标（100 episodes内）
+- SAC组件运行无错误
+- 奖励值在合理范围[-50, 50]
+- 完成率 > 80%
+
+#### 7.3.2 长期目标（1000 episodes内）
+- 平均圈速比LSTM基线快5%
+- 轨道偏离次数 < 5%
+- 连续100个episode稳定性能
+
+## 8. 开发检查清单
+
+### 8.1 架构实现
+- [ ] LSTM特征提取器集成
+- [ ] SAC Actor网络实现
+- [ ] Twin Critic网络实现
+- [ ] 经验回放池实现
+
+### 8.2 训练流程
+- [ ] 环境交互循环
+- [ ] 批量采样机制
+- [ ] SAC更新算法
+- [ ] 软更新机制
+
+### 8.3 奖励与终止
+- [ ] 分段速度奖励实现
+- [ ] 轨道保持约束
+- [ ] 平滑性奖励
+- [ ] 异常终止检测
+
+### 8.4 监控与调试
+- [ ] 训练指标记录
+- [ ] 可视化工具
+- [ ] 超参数调优接口
+- [ ] 模型保存与加载
+
+## 9. 注意事项与最佳实践
+
+### 9.1 关键原则
+- **严格遵循RL基本原理**：(state_t, action_t, reward_t, state_t+1)时序关系
+- **批量训练**：使用经验回放池批量更新，不使用单样本更新
+- **端到端优化**：LSTM与SAC联合训练，不冻结预训练参数
+
+### 9.2 常见陷阱
+- **奖励时序错误**：确保reward_t反映执行action_t的结果
+- **状态表示混淆**：区分原始输入序列和LSTM压缩特征
+- **探索不足**：确保SAC的熵正则化机制正常工作
+
+### 9.3 调优建议
+- **先验证奖励函数**：确保奖励信号引导正确行为
+- **循序渐进调参**：先调奖励权重，再调网络参数，最后调SAC超参数
+- **充分训练**：SAC收敛较慢，需要足够的训练episodes
+
+---
+
+**文档版本**：v1.0  
+**最后更新**：2025年8月  
+**维护人员**：开发团队  
+
+此文档将作为SAC系统开发的标准规范，所有实现必须严格遵循此规范进行。
+
+
+## 10. SAC 系统实施方案 (V2 - 讨论后版本)
+
+本方案基于与开发团队的深入讨论，旨在将 `new_sac_gym_env` 节点直接改造为以SAC算法为主导的在线强化学习系统。此方案取代了早期的后台监控思路，并采纳了更简洁、更直接的动作应用机制。
+
+### 10.1 核心架构与设计原则
+
+1.  **端到端学习架构**:
+    - **网络模型**: 采用集成的`SACActorNetwork`，其内部包含一个`LSTMFeatureExtractor`（用于特征提取）和一个策略头（Policy Head，用于决策）。
+    - **权重初始化**: `LSTMFeatureExtractor`将使用预训练的`best_model.pth`进行权重初始化，并在SAC训练期间**参与端到端微调（不冻结）**。
+    - **批评家网络 (`SACCriticNetwork`)**: 输入将是LSTM提取的`特征向量`和Actor输出的`动作`，维度为 `[hidden_dim + action_dim]`。
+
+2.  **状态空间 (State Space)**:
+    - 智能体的观测是完整的历史特征序列（例如，`[sequence_length=90, features=13]`）。
+    - LSTM负责将这个高维时序输入压缩成一个固定维度的`特征向量`，作为决策的依据。
+
+3.  **动作空间 (Action Space)**:
+    - **核心变更**: Actor网络将输出一个**单一维度的连续动作 `action_t`**。
+    - **物理意义**: `action_t` 代表智能体在当前状态下决策出的 **“立即要达到的目标巡航速度”**。
+    - **动作范围**: `[0, 15] m/s`。
+    - **设计原因**: 将动作定义为单一值是强化学习的标准实践，可以有效避免维度灾难，简化Critic网络的学习任务，并使信用分配更清晰。
+
+### 10.2 动作应用机制 (简化方案)
+
+此方案彻底取代了复杂的`time_to_space_mapping`函数。
+
+1.  **废除时空域映射**: 不再使用`time_to_space_mapping`函数。
+2.  **直接轨迹修改**:
+    - 创建一个新的函数 `create_direct_trajectory` 来取代旧的 `create_hybrid_trajectory`。
+    - **工作流程**:
+        a. 以官方发布的完整轨迹 (`original_trajectory_msg`) 为基础。
+        b. 确定车辆在轨迹上的当前位置索引 `current_idx`。
+        c. 定义一个短期的**速度应用范围** (Application Horizon)，例如从 `current_idx` 向前的 `N=20` 个路径点。
+        d. 在此范围内，将路径点的速度从车辆的**当前实际速度**平滑地过渡到Actor输出的目标速度 `action_t`。这可以复用或改造 `ensure_velocity_continuity` 的逻辑来实现，以保证物理可行性。
+        e. 范围之外的路径点保持其原始CSV速度不变。
+    - **发布**: 将修改后的完整轨迹发布到 `/planning/scenario_planning/trajectory`。
+
+### 10.3 奖励函数与学习流程
+
+1.  **奖励函数**:
+    - 严格按照本文档第 `4` 节定义的奖励函数 (`R_total = R_speed + R_track + R_smoothness + R_penalty`) 进行实现。这为智能体学习提供了正确和丰富的信号。
+
+2.  **主训练循环 (`planner_callback`)**:
+    - `planner_callback` 将作为智能体的核心驱动循环，实现标准的 **Agent-Environment** 交互。
+    - **时序逻辑**:
+        i. **在 `t` 时刻**:
+            - 获取状态 `s_t`。
+            - Actor根据 `s_t` 决策出动作 `a_t`。
+            - 通过 `create_direct_trajectory` 应用动作 `a_t` 并发布轨迹。
+            - **保存 `s_t` 和 `a_t`** 以备下一步使用。
+        ii. **在 `t+1` 时刻**:
+            - 获取新状态 `s_{t+1}`。
+            - 根据 `t` 到 `t+1` 的状态变化，计算出奖励 `r_t` 和终止信号 `done_t`。
+            - 将完整的经验元组 `(s_t, a_t, r_t, s_{t+1}, done_t)` 存入 `ReplayBuffer`。
+            - 如果 `ReplayBuffer` 中的数据量达到阈值，则从中采样一个 `batch`，执行一次 `sac_update` 来训练所有网络。
+
+3.  **回合管理**:
+    - **暂不实现**: 在当前开发阶段，**不实现复杂的回合重置（Reset）逻辑**。系统将连续运行和学习。
+
+### 10.4 调试与日志
+
+- 强化学习的调试高度依赖日志。必须在`SACLogger`中预留详尽的、结构化的日志输出。
+- **关键监控指标**:
+    - `Episode/Step` 摘要：`Episode: [ep], Step: [step], Total Reward: [r_total]`
+    - `奖励分解`: `Reward Breakdown: R_speed:[val], R_track:[val], R_smoothness:[val]`
+    - `网络损失`: `Losses: Actor:[loss_a], Critic:[loss_c]`
+    - `Q值监控`: `Q-Values: Q1:[q1_val], Q2:[q2_val], Target_Q:[q_target]`
+    - `Actor输出`: `Actor Output: Mean:[mean], Std:[std], Action:[act]`
+    - `熵`: `Alpha: [alpha], Entropy: [entropy]`
+    - `Replay Buffer`: `Buffer Size: [current_size]/[max_size]`
+
+此V2方案将作为后续代码实现的最终依据。
