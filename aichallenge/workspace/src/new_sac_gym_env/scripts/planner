@@ -13,6 +13,7 @@ from scipy.spatial.transform import Rotation as R
 import time
 from collections import deque
 from gymnasium import spaces
+import os
 
 from nav_msgs.msg import Odometry
 from autoware_auto_planning_msgs.msg import Trajectory
@@ -432,6 +433,11 @@ class NNPlannerNode(Node):
         self.last_decision_state_seq = None # 上一个决策周期的状态
         self.last_closest_idx = 0 # V4方案: 前进式路径点搜索
         
+        # V5方案: Episode Reset Logic for Development
+        self.moving_start_time = None
+        self.reset_after_seconds = 5.0 # 开发用：行驶5秒后重置
+        self.is_resetting = False # 防止重入
+        
         # 调试日志计数器
         self.debug_log_counter = 0
         self.debug_log_interval = 50  # 每50个周期输出一次汇总日志
@@ -481,6 +487,68 @@ class NNPlannerNode(Node):
         
         self.get_logger().info("🚀 SAC Integration Phase Complete - Ready for detailed monitoring!")
         self.get_logger().info("NN Planner Node initialized successfully")
+
+    def _reset_episode(self):
+        """
+        V5 方案: 重置 Episode via hard reset of AWSIM.
+        Creates a flag file to signal the controlling bash script.
+        """
+        if self.is_resetting:
+            return
+        self.is_resetting = True
+        self.get_logger().info("="*20 + " EPISODE RESET REQUESTED " + "="*20)
+
+        # 1. Create flag file
+        flag_file_path = "/tmp/request_awsim_reset.txt"
+        try:
+            with open(flag_file_path, "w") as f:
+                f.write("reset")
+            self.get_logger().info(f"Created reset flag file at {flag_file_path}.")
+        except Exception as e:
+            self.get_logger().error(f"Failed to create reset flag file: {e}")
+            self.is_resetting = False
+            return
+
+        # 2. Wait for the flag file to be deleted by the bash script
+        self.get_logger().info("Waiting for environment to be reset by control script...")
+        reset_start_time = time.time()
+        while os.path.exists(flag_file_path):
+            if time.time() - reset_start_time > 60: # 60秒超时
+                self.get_logger().error("Reset request timed out after 60 seconds.")
+                # Attempt to remove the file to unblock
+                os.remove(flag_file_path)
+                break
+            time.sleep(1.0)
+        
+        self.get_logger().info("Reset flag file removed. Environment reset is assumed complete.")
+        
+        # 3. Reset internal states AFTER the environment is back up.
+        self.get_logger().info("Resetting internal node state...")
+        if self.enable_sac_calculation:
+            self.sac_components['state_manager'].observation_buffer.clear()
+            self.sac_components['reward_calculator'].last_action = None
+            if hasattr(self, 'replay_buffer'):
+                 self.replay_buffer.buffer.clear()
+                 self.get_logger().info("Replay buffer cleared.")
+
+        self.last_action = 0.0
+        self.last_decision_state_seq = None
+        self.step_counter = 0
+        self.last_closest_idx = 0
+        self.moving_start_time = None
+        
+        # Critical: Clear odometry and path data, it will be republished by the new environment
+        self.current_odometry = None
+        self.original_trajectory_msg = None
+        self.static_path_pts = None
+        self._path_loaded = False # Allow the "Static path loaded" message to appear again
+        
+        # A bit of delay to allow new messages to arrive before planning continues
+        self.get_logger().info("Waiting 2 seconds for new messages to arrive...")
+        time.sleep(2.0)
+
+        self.is_resetting = False
+        self.get_logger().info("="*20 + " RESET COMPLETE & RESUMING " + "="*20)
 
     def _initialize_sac_components(self):
         """初始化SAC相关组件（V2 架构）"""
@@ -598,7 +666,26 @@ class NNPlannerNode(Node):
         if (self.current_odometry is None or 
             self.original_trajectory_msg is None or 
             self.static_path_pts is None):
+            # V5: Add a log to show why we are returning early after a reset
+            if self.is_resetting is False: # Only log if not in the middle of a reset sequence
+                self.get_logger().debug("Planner callback returning early: waiting for required data.")
             return  # 等待所有必需的数据
+
+        # V5 开发用：自动重置逻辑 (FIXED)
+        current_velocity = self.current_odometry.twist.twist.linear.x
+        if current_velocity > 0.1 and self.moving_start_time is None:
+            self.moving_start_time = self.get_clock().now()
+            self.get_logger().info(f"Vehicle moving, starting {self.reset_after_seconds}s reset timer.")
+        elif current_velocity < 0.1 and self.moving_start_time is not None:
+            self.get_logger().info("Vehicle stopped, resetting timer.")
+            self.moving_start_time = None
+
+        if self.moving_start_time is not None:
+            elapsed_seconds = (self.get_clock().now() - self.moving_start_time).nanoseconds / 1e9
+            if elapsed_seconds > self.reset_after_seconds:
+                self.get_logger().info(f"Reset timer triggered (moving for {elapsed_seconds:.2f}s). Executing hard reset...")
+                self._reset_episode()
+                return # Stop this planning callback immediately
 
         # 检查原始轨迹是否为空
         if len(self.original_trajectory_msg.points) == 0:
@@ -797,7 +884,8 @@ class NNPlannerNode(Node):
             target_q = torch.min(target_q1, target_q2) - alpha * next_log_prob
             q_target = rewards + (1.0 - dones) * gamma * target_q
 
-        current_features = self.sac_components['actor'].feature_extractor(states)
+        # 关键修复：分离(detach)特征张量，防止梯度在Critic更新时泄露到Actor的特征提取器中
+        current_features = self.sac_components['actor'].feature_extractor(states).detach()
         current_q1, current_q2 = self.sac_components['critic'](current_features, actions)
         
         critic_loss = F.mse_loss(current_q1, q_target) + F.mse_loss(current_q2, q_target)
@@ -925,7 +1013,7 @@ class NNPlannerNode(Node):
             ])
             
             # 只在静态路径首次加载时记录日志
-            if not hasattr(self, '_path_loaded'):
+            if not hasattr(self, '_path_loaded') or self._path_loaded is False:
                 self.get_logger().info(f"Static path loaded with {len(self.static_path_pts)} points")
                 self._path_loaded = True
 
