@@ -116,7 +116,50 @@ wmctrl -a "AWSIM" && wmctrl -r "AWSIM" -e 0,0,0,900,1043
 
 bash /aichallenge/publish.bash all
 
-# Wait for AWSIM to finish (this is the main process we're waiting for)
-wait "$PID_AWSIM"
+# --- V5 Reset Logic ---
+FLAG_FILE="/tmp/request_awsim_reset.txt"
+# Clean up any old flag file before starting
+rm -f "$FLAG_FILE"
 
-echo ">>> Main process finished." 
+echo ">>> Entering main monitoring loop. Waiting for reset requests or termination."
+echo ">>> The script will exit when Autoware (PID: $PID_AUTOWARE) is terminated."
+
+while kill -0 "$PID_AUTOWARE" 2>/dev/null; do
+    if [ -f "$FLAG_FILE" ]; then
+        echo ""
+        echo ">>> Reset request detected. Restarting AWSIM..."
+
+        # 1. Kill old AWSIM using pkill for robustness (FIXED)
+        echo "    Terminating old AWSIM processes by name (AWSIM.x86_64)..."
+        pkill -SIGKILL -f AWSIM.x86_64
+        echo "    Waiting for old AWSIM launch script (PID: $PID_AWSIM) to terminate..."
+        wait "$PID_AWSIM" 2>/dev/null # Wait for the original script process to be fully gone
+
+        # Remove the old PID from the master PID file to avoid killing it again in cleanup
+        echo "    Removing old PID $PID_AWSIM from tracking file."
+        sed -i "/^$PID_AWSIM$/d" "$PID_FILE"
+
+        # 2. Restart AWSIM
+        echo "    Restarting AWSIM..."
+        nohup /aichallenge/run_simulator.bash > ./awsim.log 2>&1 &
+        PID_AWSIM=$!
+        echo "$PID_AWSIM" >> "$PID_FILE" # Add new PID to the master list
+        echo "    New AWSIM started with PID: $PID_AWSIM"
+
+        # 3. Wait for simulator to be ready and re-initialize Autoware
+        echo "    Waiting 15 seconds for simulator to initialize..."
+        sleep 15
+        echo "    Re-initializing Autoware state..."
+        bash /aichallenge/publish.bash all
+        
+        # 4. Remove flag file to signal completion
+        rm -f "$FLAG_FILE"
+        echo ">>> Reset complete. Planner node should resume."
+        echo ""
+    fi
+
+    sleep 2 # Check for flag file every 2 seconds
+done
+
+echo ">>> Autoware process (PID $PID_AUTOWARE) is no longer running. Script will now exit and trigger cleanup."
+# The trap will call cleanup 
